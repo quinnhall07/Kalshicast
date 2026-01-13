@@ -3,7 +3,7 @@ name: Weather pipeline
 on:
   schedule:
     # GitHub Actions cron is UTC. :contentReference[oaicite:4]{index=4}
-    - cron: "0 6 * * *"   # 1:00am America/New_York = 06:00 UTC (standard time)
+    - cron: "58 5 * * *"   # 1:00am America/New_York = 06:00 UTC (standard time)
     - cron: "3 6 * * *"   # 1:03am America/New_York = 06:03 UTC
   workflow_dispatch: {}
 
@@ -28,7 +28,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run morning
-        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 6 * * *'
+        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '58 5 * * *'
         run: python morning.py
 
       - name: Run night
