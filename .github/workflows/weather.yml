@@ -1,0 +1,35 @@
+name: Weather pipeline
+
+on:
+  schedule:
+    # GitHub Actions cron is UTC. :contentReference[oaicite:4]{index=4}
+    - cron: "0 6 * * *"   # 1:00am America/New_York = 06:00 UTC (standard time)
+    - cron: "3 6 * * *"   # 1:03am America/New_York = 06:03 UTC
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      WEATHER_DB_URL: ${{ secrets.WEATHER_DB_URL }}
+      TOMORROW_API_KEY: ${{ secrets.TOMORROW_API_KEY }}
+      WEATHERAPI_KEY: ${{ secrets.WEATHERAPI_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run morning
+        if: github.event.schedule == '0 6 * * *'
+        run: python morning.py
+
+      - name: Run night
+        if: github.event.schedule == '3 6 * * *'
+        run: python night.py
