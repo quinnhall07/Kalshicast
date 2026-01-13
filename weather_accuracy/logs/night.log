@@ -1,0 +1,95 @@
+.LOGTraceback (most recent call last):
+  File "C:\Users\danie\weather_accuracy\venv\Lib\site-packages\urllib3\connection.py", line 204, in _new_conn
+    sock = connection.create_connection(
+        (self._dns_host, self.port),
+    ...<2 lines>...
+        socket_options=self.socket_options,
+    )
+  File "C:\Users\danie\weather_accuracy\venv\Lib\site-packages\urllib3\util\connection.py", line 60, in create_connection
+    for res in socket.getaddrinfo(host, port, family, socket.SOCK_STREAM):
+               ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\danie\AppData\Local\Python\pythoncore-3.14-64\Lib\socket.py", line 983, in getaddrinfo
+    for res in _socket.getaddrinfo(host, port, family, type, proto, flags):
+               ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+socket.gaierror: [Errno 11001] getaddrinfo failed
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\danie\weather_accuracy\venv\Lib\site-packages\urllib3\connectionpool.py", line 787, in urlopen
+    response = self._make_request(
+        conn,
+    ...<10 lines>...
+        **response_kw,
+    )
+  File "C:\Users\danie\weather_accuracy\venv\Lib\site-packages\urllib3\connectionpool.py", line 488, in _make_request
+    raise new_e
+  File "C:\Users\danie\weather_accuracy\venv\Lib\site-packages\urllib3\connectionpool.py", line 464, in _make_request
+    self._validate_conn(conn)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "C:\Users\danie\weather_accuracy\venv\Lib\site-packages\urllib3\connectionpool.py", line 1093, in _validate_conn
+    conn.connect()
+    ~~~~~~~~~~~~^^
+  File "C:\Users\danie\weather_accuracy\venv\Lib\site-packages\urllib3\connection.py", line 759, in connect
+    self.sock = sock = self._new_conn()
+                       ~~~~~~~~~~~~~~^^
+  File "C:\Users\danie\weather_accuracy\venv\Lib\site-packages\urllib3\connection.py", line 211, in _new_conn
+    raise NameResolutionError(self.host, self, e) from e
+urllib3.exceptions.NameResolutionError: HTTPSConnection(host='w1.weather.gov', port=443): Failed to resolve 'w1.weather.gov' ([Errno 11001] getaddrinfo failed)
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\danie\weather_accuracy\venv\Lib\site-packages\requests\adapters.py", line 644, in send
+    resp = conn.urlopen(
+        method=request.method,
+    ...<9 lines>...
+        chunked=chunked,
+    )
+  File "C:\Users\danie\weather_accuracy\venv\Lib\site-packages\urllib3\connectionpool.py", line 841, in urlopen
+    retries = retries.increment(
+        method, url, error=new_e, _pool=self, _stacktrace=sys.exc_info()[2]
+    )
+  File "C:\Users\danie\weather_accuracy\venv\Lib\site-packages\urllib3\util\retry.py", line 535, in increment
+    raise MaxRetryError(_pool, url, reason) from reason  # type: ignore[arg-type]
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+urllib3.exceptions.MaxRetryError: HTTPSConnectionPool(host='w1.weather.gov', port=443): Max retries exceeded with url: /data/obhistory/KNYC.html (Caused by NameResolutionError("HTTPSConnection(host='w1.weather.gov', port=443): Failed to resolve 'w1.weather.gov' ([Errno 11001] getaddrinfo failed)"))
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\danie\weather_accuracy\night.py", line 12, in <module>
+    main()
+    ~~~~^^
+  File "C:\Users\danie\weather_accuracy\night.py", line 8, in main
+    fetch_observations()
+    ~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\danie\weather_accuracy\cli_observations.py", line 10, in fetch_observations
+    r = requests.get(URL, timeout=10)
+  File "C:\Users\danie\weather_accuracy\venv\Lib\site-packages\requests\api.py", line 73, in get
+    return request("get", url, params=params, **kwargs)
+  File "C:\Users\danie\weather_accuracy\venv\Lib\site-packages\requests\api.py", line 59, in request
+    return session.request(method=method, url=url, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\danie\weather_accuracy\venv\Lib\site-packages\requests\sessions.py", line 589, in request
+    resp = self.send(prep, **send_kwargs)
+  File "C:\Users\danie\weather_accuracy\venv\Lib\site-packages\requests\sessions.py", line 703, in send
+    r = adapter.send(request, **kwargs)
+  File "C:\Users\danie\weather_accuracy\venv\Lib\site-packages\requests\adapters.py", line 677, in send
+    raise ConnectionError(e, request=request)
+requests.exceptions.ConnectionError: HTTPSConnectionPool(host='w1.weather.gov', port=443): Max retries exceeded with url: /data/obhistory/KNYC.html (Caused by NameResolutionError("HTTPSConnection(host='w1.weather.gov', port=443): Failed to resolve 'w1.weather.gov' ([Errno 11001] getaddrinfo failed)"))
+[cli_observations] Fetched observations from https://forecast.weather.gov/data/obhistory/KNYC.html
+[cli_observations] Could not parse high/low values.
+[night] Skipping scoring because observations were not fetched.
+[obs] OK KNYC 2026-01-12: high=39.9 low=32.0
+[obs] OK KMIA 2026-01-12: high=77.0 low=64.4
+[score] MISS same-day KNYC NWS forecast_date=2026-01-12 target_date=2026-01-12
+[score] MISS next-day KNYC NWS forecast_date=2026-01-11 target_date=2026-01-12
+[score] MISS same-day KNYC OME forecast_date=2026-01-12 target_date=2026-01-12
+[score] MISS next-day KNYC OME forecast_date=2026-01-11 target_date=2026-01-12
+[score] OK KNYC 2026-01-12
+[score] MISS same-day KMIA NWS forecast_date=2026-01-12 target_date=2026-01-12
+[score] MISS next-day KMIA NWS forecast_date=2026-01-11 target_date=2026-01-12
+[score] MISS same-day KMIA OME forecast_date=2026-01-12 target_date=2026-01-12
+[score] MISS next-day KMIA OME forecast_date=2026-01-11 target_date=2026-01-12
+[score] OK KMIA 2026-01-12
