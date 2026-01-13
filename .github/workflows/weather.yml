@@ -14,6 +14,7 @@ jobs:
       WEATHER_DB_URL: ${{ secrets.WEATHER_DB_URL }}
       TOMORROW_API_KEY: ${{ secrets.TOMORROW_API_KEY }}
       WEATHERAPI_KEY: ${{ secrets.WEATHERAPI_KEY }}
+      VISUALCROSSING_KEY: ${{ secrets.VISUALCROSSING_KEY }}
     steps:
       - uses: actions/checkout@v4
 
