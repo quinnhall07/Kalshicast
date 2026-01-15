@@ -17,7 +17,9 @@ from db import (
     upsert_location,
     get_or_create_forecast_run,
     upsert_forecast_value,
-    compute_revisions_for_run
+    compute_revisions_for_run,
+    get_conn,
+    bulk_upsert_forecast_values,
 )
 
 
@@ -130,7 +132,7 @@ def main() -> None:
 
     fetchers = load_fetchers_safe()
     if not fetchers:
-        print("[morning] ERROR: no enabled sources loaded (check config.SOURCES).")
+        print("[morning] ERROR: no enabled sources loaded (check config.SOURCES).", flush=True)
         return
 
     tasks = []
@@ -139,73 +141,84 @@ def main() -> None:
             for source_id, fetcher in fetchers.items():
                 tasks.append(ex.submit(_fetch_one, st, source_id, fetcher))
 
-        # Process results as they finish
-        for fut in concurrent.futures.as_completed(tasks):
-            station_id, st, source_id, issued_at, rows, err = fut.result()
+        # ONE shared DB connection for the write phase (fast)
+        with get_conn() as conn:
+            for fut in concurrent.futures.as_completed(tasks):
+                station_id, st, source_id, issued_at, rows, err = fut.result()
 
-            if err is not None:
-                print(f"[morning] FAIL {station_id} {source_id}: {err}", flush=True)
-                continue
+                if err is not None:
+                    print(f"[morning] FAIL {station_id} {source_id}: {err}", flush=True)
+                    continue
 
-            if not rows:
-                print(f"[morning] WARN {station_id} {source_id}: no rows", flush=True)
-                continue
-                
+                if not rows:
+                    print(f"[morning] WARN {station_id} {source_id}: no rows", flush=True)
+                    continue
+
+                # Create/get run_id
                 run_id = get_or_create_forecast_run(source=source_id, issued_at=issued_at)
-                
+
+                # Build a batch (2 rows per target_date: high + low)
+                batch = []
                 for r in rows:
                     td = r["target_date"]
                     extras = r.get("extras") or {}
-                    
+                    extras_json = json.dumps(extras)
+
                     lead_high = compute_lead_hours(
                         station_tz=st["timezone"],
                         issued_at=issued_at,
                         target_date=td,
                         kind="high",
                     )
-                    
                     lead_low = compute_lead_hours(
                         station_tz=st["timezone"],
                         issued_at=issued_at,
                         target_date=td,
                         kind="low",
                     )
-                    
-                    upsert_forecast_value(
-                        run_id=run_id,
-                        station_id=station_id,
-                        target_date=td,
-                        kind="high",
-                        value_f=r["high"],
-                        lead_hours=lead_high,
-                        extras=extras,
-                    )
-                    
-                    upsert_forecast_value(
-                        run_id=run_id,
-                        station_id=station_id,
-                        target_date=td,
-                        kind="low",
-                        value_f=r["low"],
-                        lead_hours=lead_low,
-                        extras=extras,
-                    )
-                print(f"[morning] OK {station_id} {source_id}: saved {len(rows)} day(s) issued_at={issued_at}")
+
+                    batch.append({
+                        "run_id": run_id,
+                        "station_id": station_id,
+                        "target_date": td,
+                        "kind": "high",
+                        "value_f": r["high"],
+                        "lead_hours": lead_high,
+                        "extras_json": extras_json,
+                    })
+                    batch.append({
+                        "run_id": run_id,
+                        "station_id": station_id,
+                        "target_date": td,
+                        "kind": "low",
+                        "value_f": r["low"],
+                        "lead_hours": lead_low,
+                        "extras_json": extras_json,
+                    })
+
+                # Batched write (single round trip)
+                wrote = bulk_upsert_forecast_values(conn, batch)
+                conn.commit()
+
+                print(f"[morning] OK {station_id} {source_id}: wrote {wrote} rows issued_at={issued_at}", flush=True)
+
+                # Revisions (optional but keep it here for now)
                 try:
                     wrote_rev = compute_revisions_for_run(run_id)
                     if wrote_rev:
-                        print(f"[morning] revisions {station_id} {source_id}: {wrote_rev}")
+                        conn.commit()
+                        print(f"[morning] revisions {station_id} {source_id}: {wrote_rev}", flush=True)
                 except Exception as e:
-                    print(f"[morning] revisions FAIL {station_id} {source_id}: {e}")
-            except Exception as e:
-                print(f"[morning] FAIL {station_id} {source_id}: {e}")
+                    print(f"[morning] revisions FAIL {station_id} {source_id}: {e}", flush=True)
 
-            if source_id.startswith("OME_"):
-                time.sleep(0.4 + random.random() * 0.6)
+                # Provider throttle (only after successful processing)
+                if source_id.startswith("OME_"):
+                    time.sleep(0.4 + random.random() * 0.6)
 
 
 if __name__ == "__main__":
     main()
+
 
 
 
