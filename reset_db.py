@@ -1,49 +1,39 @@
 # reset_db.py
 from __future__ import annotations
 
-from db import get_conn
-
-
-def _is_postgres_conn(conn) -> bool:
-    # psycopg/psycopg2 connections won't be sqlite3.Connection
-    try:
-        import sqlite3
-        return not isinstance(conn, sqlite3.Connection)
-    except Exception:
-        return True
+from db import get_conn, _is_postgres
 
 
 def reset_db() -> None:
     conn = get_conn()
     cur = conn.cursor()
 
-    if _is_postgres_conn(conn):
-        # Supabase/Postgres
-        # TRUNCATE is fast and also clears dependent rows with CASCADE
+    if _is_postgres():
         cur.execute("""
             TRUNCATE TABLE
-              scores,
+              forecast_errors,
+              error_stats,
               forecasts,
+              forecast_runs,
               observations,
-              sources,
-              stations
+              locations
             CASCADE;
         """)
         conn.commit()
         conn.close()
-        print("Supabase/Postgres database cleared: scores, forecasts, observations, sources, stations")
+        print("Postgres reset complete.")
         return
 
     # SQLite
-    # Delete children first to satisfy FK constraints
-    cur.execute("DELETE FROM scores;")
+    cur.execute("DELETE FROM forecast_errors;")
+    cur.execute("DELETE FROM error_stats;")
     cur.execute("DELETE FROM forecasts;")
+    cur.execute("DELETE FROM forecast_runs;")
     cur.execute("DELETE FROM observations;")
-    cur.execute("DELETE FROM sources;")
-    cur.execute("DELETE FROM stations;")
+    cur.execute("DELETE FROM locations;")
     conn.commit()
     conn.close()
-    print("SQLite database cleared: scores, forecasts, observations, sources, stations")
+    print("SQLite reset complete.")
 
 
 if __name__ == "__main__":
