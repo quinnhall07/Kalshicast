@@ -1,6 +1,6 @@
 # morning.py
 from __future__ import annotations
-
+import concurrent.futures
 import json
 import random
 import time
@@ -20,9 +20,9 @@ from db import (
 )
 
 
-MAX_ATTEMPTS = 10
+MAX_ATTEMPTS = 5
 BASE_SLEEP_SECONDS = 2.0
-
+FETCH_TIMEOUT_SECONDS = 30
 
 def _coerce_float(x: Any) -> float:
     if isinstance(x, (int, float)):
@@ -49,20 +49,32 @@ def _is_retryable_error(e: Exception) -> bool:
     ])
 
 
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+
 def _call_fetcher_with_retry(fetcher, station: dict, source_id: str) -> Any:
     last_exc: Exception | None = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            return fetcher(station)
+            print(f"[morning] fetch start {station['station_id']} {source_id} attempt={attempt}", flush=True)
+            fut = _executor.submit(fetcher, station)
+            return fut.result(timeout=FETCH_TIMEOUT_SECONDS)
+        except concurrent.futures.TimeoutError as e:
+            last_exc = e
+            msg = f"fetch timeout after {FETCH_TIMEOUT_SECONDS}s"
+            if attempt >= MAX_ATTEMPTS:
+                raise RuntimeError(msg) from e
+            sleep_s = min(5.0, (BASE_SLEEP_SECONDS * attempt) + random.random() * 0.5)
+            print(f"[morning] RETRY {station['station_id']} {source_id} attempt {attempt}/{MAX_ATTEMPTS}: {msg}", flush=True)
+            time.sleep(sleep_s)
         except Exception as e:
             last_exc = e
             if attempt >= MAX_ATTEMPTS or not _is_retryable_error(e):
                 raise
-            sleep_s = (BASE_SLEEP_SECONDS * attempt) + random.random() * 0.5
-            print(f"[morning] RETRY {station['station_id']} {source_id} attempt {attempt}/{MAX_ATTEMPTS}: {e}")
+            sleep_s = min(5.0, (BASE_SLEEP_SECONDS * attempt) + random.random() * 0.5)
+            print(f"[morning] RETRY {station['station_id']} {source_id} attempt {attempt}/{MAX_ATTEMPTS}: {e}", flush=True)
             time.sleep(sleep_s)
     raise last_exc  # unreachable
-
+    
 
 def _normalize_payload(raw: Any) -> Tuple[str, List[Dict[str, Any]]]:
     """
@@ -190,5 +202,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
