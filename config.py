@@ -2,7 +2,7 @@
 DB_PATH = "weather.db"
 
 HEADERS = {
-    "User-Agent": "weather_accuracy/1.0 (contact: quinn.hall.scho@gmail.com)"
+    "User-Agent": "Kalshicast/1.0 (contact: quinn.hall.scho@gmail.com)"
 }
 
 STATIONS = [
@@ -196,4 +196,5 @@ SOURCES = {
     },
 
 }
+
 
