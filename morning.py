@@ -21,8 +21,8 @@ from db import (
 )
 
 
-MAX_ATTEMPTS = 5
-BASE_SLEEP_SECONDS = 2.0
+MAX_ATTEMPTS = 4
+BASE_SLEEP_SECONDS = 1.0
 FETCH_TIMEOUT_SECONDS = 30
 
 def _coerce_float(x: Any) -> float:
@@ -143,11 +143,9 @@ def main() -> None:
                 if not rows:
                     print(f"[morning] WARN {station_id} {source_id}: no rows")
                     continue
-
-                run_id = get_or_create_forecast_run(source=source_id, issued_at=issued_at, meta_json=json.dumps({
-                    "station_id": station_id
-                }))
-
+                
+                run_id = get_or_create_forecast_run(source=source_id, issued_at=issued_at)
+                
                 for r in rows:
                     td = r["target_date"]
                     extras = r.get("extras") or {}
@@ -201,6 +199,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
 
