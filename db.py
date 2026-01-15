@@ -253,6 +253,82 @@ def _percentile(sorted_vals: List[float], p: float) -> float:
     d1 = sorted_vals[c] * (k - f)
     return float(d0 + d1)
 
+# db.py (ADD these functions at end)
+from typing import Optional
+
+def compute_revisions_for_run(run_id: str) -> int:
+    """
+    For all forecast rows in a run, compute delta vs previous issued_at for the same
+    (station_id, source, kind, target_date). Idempotent via PK.
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        select r.source, r.issued_at, f.station_id, f.target_date, f.kind, f.value_f
+        from public.forecasts f
+        join public.forecast_runs r on r.run_id = f.run_id
+        where f.run_id = %s::uuid
+        """,
+        (run_id,),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        conn.close()
+        return 0
+
+    wrote = 0
+    for source, issued_at, station_id, target_date, kind, forecast_f in rows:
+        if forecast_f is None:
+            continue
+
+        cur.execute(
+            """
+            select r2.issued_at, f2.value_f
+            from public.forecasts f2
+            join public.forecast_runs r2 on r2.run_id = f2.run_id
+            where f2.station_id=%s
+              and r2.source=%s
+              and f2.kind=%s
+              and f2.target_date=%s::date
+              and r2.issued_at < %s::timestamptz
+            order by r2.issued_at desc
+            limit 1
+            """,
+            (station_id, source, kind, target_date, issued_at),
+        )
+        prev = cur.fetchone()
+        prev_issued_at = prev[0] if prev else None
+        prev_forecast_f = float(prev[1]) if (prev and prev[1] is not None) else None
+        delta_f = (float(forecast_f) - prev_forecast_f) if prev_forecast_f is not None else None
+
+        cur.execute(
+            """
+            insert into public.forecast_revisions
+              (station_id, source, kind, target_date, issued_at, forecast_f,
+               prev_issued_at, prev_forecast_f, delta_f)
+            values
+              (%s,%s,%s,%s::date,%s::timestamptz,%s,%s::timestamptz,%s,%s)
+            on conflict (station_id, source, kind, target_date, issued_at) do nothing
+            """,
+            (
+                station_id,
+                source,
+                kind,
+                target_date,
+                issued_at,
+                float(forecast_f),
+                prev_issued_at,
+                prev_forecast_f,
+                delta_f,
+            ),
+        )
+        wrote += 1
+
+    conn.commit()
+    conn.close()
+    return wrote
 
 def update_error_stats(*, window_days: int, station_id: Optional[str] = None) -> None:
     conn = get_conn()
@@ -333,3 +409,4 @@ def update_error_stats(*, window_days: int, station_id: Optional[str] = None) ->
 
     conn.commit()
     conn.close()
+
