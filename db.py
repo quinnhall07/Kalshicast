@@ -133,7 +133,7 @@ def get_or_create_forecast_run(source: str, issued_at: str, conn=None) -> int:
                 insert into public.forecast_runs (source, issued_at)
                 values (%s, %s)
                 on conflict (source, issued_at) do update set source = excluded.source
-                returning id;
+                returning run_id;
             """, (source, issued_at))
             run_id = cur.fetchone()[0]
         if owns:
@@ -435,5 +435,6 @@ def update_error_stats(*, window_days: int, station_id: Optional[str] = None) ->
 
     conn.commit()
     conn.close()
+
 
 
