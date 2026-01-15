@@ -1,3 +1,4 @@
+#cli_observations.py
 from __future__ import annotations
 
 import math
@@ -89,4 +90,5 @@ def fetch_observations(target_date: str) -> bool:
         except Exception as e:
             print(f"[obs] FAIL {st.get('station_id')} {target_date}: {e}")
     return any_ok
+
 
