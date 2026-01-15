@@ -11,10 +11,7 @@ from score import score_day
 def main() -> None:
     init_db()
 
-    # Score the day that just finished
     target_date = (date.today() - timedelta(days=1)).isoformat()
-
-    # fetch_observations should return True if at least one station succeeded
     ok_any = fetch_observations(target_date)
 
     if ok_any:
