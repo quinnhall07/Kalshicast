@@ -35,16 +35,16 @@ def _extract_temps_f(features: List[dict]) -> List[float]:
 def fetch_observations_for_station(station: dict, target_date: str) -> bool:
     station_id = station["station_id"]
 
-    upsert_location(
-        station_id=station_id,
-        name=station.get("name"),
-        lat=station.get("lat"),
-        lon=station.get("lon"),
-        timezone=station.get("timezone"),
-        state=station.get("state"),
-        elevation_ft=station.get("elevation_ft"),
-        is_active=station.get("is_active"),
-    )
+    upsert_location({
+        "station_id": station_id,
+        "name": station.get("name"),
+        "lat": station.get("lat"),
+        "lon": station.get("lon"),
+        "timezone": station.get("timezone"),
+        "state": station.get("state"),
+        "elevation_ft": station.get("elevation_ft"),
+        "is_active": station.get("is_active"),
+    })
 
     target = date.fromisoformat(target_date)
     tz = ZoneInfo(station.get("timezone") or "UTC")
@@ -98,5 +98,6 @@ def fetch_observations(target_date: str) -> bool:
         except Exception as e:
             print(f"[obs] FAIL {st.get('station_id')} {target_date}: {e}")
     return any_ok
+
 
 
