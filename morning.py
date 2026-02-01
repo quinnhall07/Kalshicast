@@ -23,6 +23,12 @@ from db import (
     bulk_upsert_forecast_values,
 )
 
+import os
+
+DEBUG_SOURCE = os.getenv("DEBUG_SOURCE")   # e.g. "OME_GFS"
+DEBUG_STATION = os.getenv("DEBUG_STATION") # e.g. "KMDW"
+DEBUG_DUMP = os.getenv("DEBUG_DUMP", "0") == "1"
+
 MAX_ATTEMPTS = 4
 BASE_SLEEP_SECONDS = 1.0
 FETCH_TIMEOUT_SECONDS = 30
@@ -164,6 +170,18 @@ def _fetch_one(st: dict, source_id: str, fetcher, fallback_issued_at: str):
     station_id = st["station_id"]
     try:
         raw = _call_fetcher_with_retry(fetcher, st, source_id)
+        if DEBUG_DUMP and (DEBUG_SOURCE == source_id) and (DEBUG_STATION == station_id):
+            # Print only the keys + a small sample to avoid huge logs / secrets
+            if isinstance(raw, dict):
+                print("[debug] raw dict keys:", list(raw.keys()), flush=True)
+                rows = raw.get("rows")
+                if isinstance(rows, list) and rows:
+                    print("[debug] raw first row:", json.dumps(rows[0], default=str)[:2000], flush=True)
+            elif isinstance(raw, list) and raw:
+                print("[debug] raw first row:", json.dumps(raw[0], default=str)[:2000], flush=True)
+            else:
+                print("[debug] raw type:", type(raw), flush=True)
+
         issued_at, rows = _normalize_payload(raw, fallback_issued_at=fallback_issued_at)
         return (station_id, st, source_id, issued_at, rows, None)
     except Exception as e:
@@ -284,4 +302,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
