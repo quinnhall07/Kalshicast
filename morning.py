@@ -142,7 +142,7 @@ def _normalize_payload(raw: Any, *, fallback_issued_at: str) -> Tuple[str, List[
         high = _coerce_float(r["high"])
         low = _coerce_float(r["low"])
 
-                extras: Dict[str, Any] = {}
+        extras: Dict[str, Any] = {}
 
         # 1) Pull from top-level (your current behavior)
         for k in (
@@ -302,5 +302,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
