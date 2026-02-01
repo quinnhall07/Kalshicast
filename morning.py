@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import os
 import random
 import time
+import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
-import threading
 
 import requests
 
@@ -23,15 +24,19 @@ from db import (
     bulk_upsert_forecast_values,
 )
 
-import os
-
-DEBUG_SOURCE = os.getenv("DEBUG_SOURCE")   # e.g. "OME_GFS"
-DEBUG_STATION = os.getenv("DEBUG_STATION") # e.g. "KMDW"
+# -------------------------
+# Debug knobs (set via env)
+# -------------------------
 DEBUG_DUMP = os.getenv("DEBUG_DUMP", "0") == "1"
+DEBUG_SOURCE = os.getenv("DEBUG_SOURCE", "")     # exact source_id, e.g. "OME_GFS"
+DEBUG_STATION = os.getenv("DEBUG_STATION", "")   # exact station_id, e.g. "KMDW"
 
+# -------------------------
+# Retry / throttling
+# -------------------------
 MAX_ATTEMPTS = 4
 BASE_SLEEP_SECONDS = 1.0
-FETCH_TIMEOUT_SECONDS = 30
+FETCH_TIMEOUT_SECONDS = 30  # (left here for future use if fetchers accept timeout)
 
 _PROVIDER_LIMITS = {
     "TOM": threading.Semaphore(1),   # Tomorrow.io
@@ -99,7 +104,10 @@ def _call_fetcher_with_retry(fetcher, station: dict, source_id: str) -> Any:
                 5.0, (BASE_SLEEP_SECONDS * attempt) + random.random() * 0.5
             )
 
-            print(f"[morning] RETRY {station['station_id']} {source_id} attempt {attempt}/{MAX_ATTEMPTS}: {e}", flush=True)
+            print(
+                f"[morning] RETRY {station['station_id']} {source_id} attempt {attempt}/{MAX_ATTEMPTS}: {e}",
+                flush=True,
+            )
             time.sleep(sleep_s)
 
     raise last_exc  # pragma: no cover
@@ -144,7 +152,7 @@ def _normalize_payload(raw: Any, *, fallback_issued_at: str) -> Tuple[str, List[
 
         extras: Dict[str, Any] = {}
 
-        # 1) Pull from top-level (your current behavior)
+        # 1) Top-level keys
         for k in (
             "dewpoint_f", "humidity_pct", "wind_speed_mph", "wind_dir_deg",
             "cloud_cover_pct", "precip_prob_pct"
@@ -152,7 +160,7 @@ def _normalize_payload(raw: Any, *, fallback_issued_at: str) -> Tuple[str, List[
             if k in r and r[k] is not None:
                 extras[k] = r[k]
 
-        # 2) Also merge nested extras if present
+        # 2) Nested extras dict
         nested = r.get("extras")
         if isinstance(nested, dict):
             for k in (
@@ -166,34 +174,45 @@ def _normalize_payload(raw: Any, *, fallback_issued_at: str) -> Tuple[str, List[
 
     return issued_at, out
 
+def _debug_match(station_id: str, source_id: str) -> bool:
+    return DEBUG_DUMP and (DEBUG_SOURCE == source_id) and (DEBUG_STATION == station_id)
+
 def _fetch_one(st: dict, source_id: str, fetcher, fallback_issued_at: str):
     station_id = st["station_id"]
     try:
         raw = _call_fetcher_with_retry(fetcher, st, source_id)
-        if DEBUG_DUMP and (DEBUG_SOURCE == source_id) and (DEBUG_STATION == station_id):
-            # Print only the keys + a small sample to avoid huge logs / secrets
+
+        if _debug_match(station_id, source_id):
+            print("[DEBUG raw type]", type(raw), flush=True)
             if isinstance(raw, dict):
-                print("[debug] raw dict keys:", list(raw.keys()), flush=True)
-                rows = raw.get("rows")
-                if isinstance(rows, list) and rows:
-                    print("[debug] raw first row:", json.dumps(rows[0], default=str)[:2000], flush=True)
+                print("[DEBUG raw keys]", list(raw.keys()), flush=True)
+                rr = raw.get("rows")
+                if isinstance(rr, list) and rr:
+                    print("[DEBUG raw first row]", json.dumps(rr[0], default=str)[:2000], flush=True)
             elif isinstance(raw, list) and raw:
-                print("[debug] raw first row:", json.dumps(raw[0], default=str)[:2000], flush=True)
-            else:
-                print("[debug] raw type:", type(raw), flush=True)
+                print("[DEBUG raw first row]", json.dumps(raw[0], default=str)[:2000], flush=True)
 
         issued_at, rows = _normalize_payload(raw, fallback_issued_at=fallback_issued_at)
-        if DEBUG_DUMP and source_id == DEBUG_SOURCE and station_id == DEBUG_STATION:
-            if rows:
-                print("[DEBUG normalized first row]",
-                      json.dumps(rows[0], default=str)[:2000],
-                      flush=True)
+
+        if _debug_match(station_id, source_id) and rows:
+            print("[DEBUG normalized first row]", json.dumps(rows[0], default=str)[:2000], flush=True)
+
         return (station_id, st, source_id, issued_at, rows, None)
+
     except Exception as e:
         return (station_id, st, source_id, None, [], e)
 
 def main() -> None:
     init_db()
+
+    # Guaranteed visibility into whether DEBUG env vars are set
+    print(
+        "[DEBUG env]",
+        "DEBUG_DUMP=", os.getenv("DEBUG_DUMP"),
+        "DEBUG_SOURCE=", os.getenv("DEBUG_SOURCE"),
+        "DEBUG_STATION=", os.getenv("DEBUG_STATION"),
+        flush=True,
+    )
 
     for st in STATIONS:
         upsert_location(st)
@@ -202,6 +221,12 @@ def main() -> None:
     if not fetchers:
         print("[morning] ERROR: no enabled sources loaded (check config.SOURCES).", flush=True)
         return
+
+    if DEBUG_DUMP:
+        print("[DEBUG available sources]", sorted(fetchers.keys()), flush=True)
+        print("[DEBUG available stations]", [s["station_id"] for s in STATIONS], flush=True)
+        if not DEBUG_SOURCE or not DEBUG_STATION:
+            print("[DEBUG] Set DEBUG_SOURCE and DEBUG_STATION to enable payload dumps.", flush=True)
 
     # Stable fallback issued_at for this entire workflow run (prevents run fragmentation)
     fallback_issued_at = (
@@ -219,7 +244,6 @@ def main() -> None:
             for source_id, fetcher in fetchers.items():
                 tasks.append(ex.submit(_fetch_one, st, source_id, fetcher, fallback_issued_at))
 
-        # ONE shared DB connection for the write phase (fast)
         with get_conn() as conn:
             for fut in concurrent.futures.as_completed(tasks):
                 station_id, st, source_id, issued_at, rows, err = fut.result()
@@ -236,11 +260,13 @@ def main() -> None:
                 run_id = get_or_create_forecast_run(source=source_id, issued_at=issued_at, conn=conn)
                 touched_run_ids.add(run_id)
 
-                # Build a batch (2 rows per target_date: high + low)
                 batch: List[Dict[str, Any]] = []
                 for r in rows:
                     td = r["target_date"]
                     extras = r.get("extras") or {}
+
+                    if _debug_match(station_id, source_id):
+                        print("[DEBUG extras dict]", extras, flush=True)
 
                     lead_high = compute_lead_hours(
                         station_tz=st["timezone"],
@@ -302,12 +328,5 @@ def main() -> None:
                     except Exception as e:
                         print(f"[morning] revisions FAIL run_id={run_id}: {e}", flush=True)
 
-    # Provider throttle isn't needed here anymore because we already throttle in fetch.
-    # If you still want extra Open-Meteo pacing, implement it inside the fetcher itself.
-
 if __name__ == "__main__":
     main()
-
-
-
-
