@@ -136,10 +136,25 @@ def _normalize_payload(raw: Any, *, fallback_issued_at: str) -> Tuple[str, List[
         high = _coerce_float(r["high"])
         low = _coerce_float(r["low"])
 
-        extras = {k: r[k] for k in (
+                extras: Dict[str, Any] = {}
+
+        # 1) Pull from top-level (your current behavior)
+        for k in (
             "dewpoint_f", "humidity_pct", "wind_speed_mph", "wind_dir_deg",
             "cloud_cover_pct", "precip_prob_pct"
-        ) if k in r}
+        ):
+            if k in r and r[k] is not None:
+                extras[k] = r[k]
+
+        # 2) Also merge nested extras if present
+        nested = r.get("extras")
+        if isinstance(nested, dict):
+            for k in (
+                "dewpoint_f", "humidity_pct", "wind_speed_mph", "wind_dir_deg",
+                "cloud_cover_pct", "precip_prob_pct"
+            ):
+                if k in nested and nested[k] is not None:
+                    extras.setdefault(k, nested[k])
 
         out.append({"target_date": td, "high": high, "low": low, "extras": extras})
 
@@ -269,3 +284,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
