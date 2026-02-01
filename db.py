@@ -376,7 +376,7 @@ def update_error_stats(*, window_days: int, station_id: Optional[str] = None) ->
 
     cur.execute(
         f"""
-        select source, kind, error_f, abs_error_f
+        select station_id, source, kind, error_f, abs_error_f
         from public.forecast_errors
         where target_date >= (now()::date - (%s::int * interval '1 day'))
         {station_clause}
@@ -385,16 +385,22 @@ def update_error_stats(*, window_days: int, station_id: Optional[str] = None) ->
     )
     rows = cur.fetchall()
 
-    by: Dict[Tuple[str, str], List[Tuple[float, float]]] = {}
-    for source, kind, e, ae in rows:
+    # key: (station_id, source, kind) -> [(error, abs_error), ...]
+    by: Dict[Tuple[str, str, str], List[Tuple[float, float]]] = {}
+    for st_id, source, kind, e, ae in rows:
+        if st_id is None or source is None or kind is None:
+            continue
         if e is None or ae is None:
             continue
-        by.setdefault((str(source), str(kind)), []).append((float(e), float(ae)))
+        by.setdefault((str(st_id), str(source), str(kind)), []).append((float(e), float(ae)))
 
     now_ts = utc_now_z()
 
-    for (source, kind), vals in by.items():
+    for (st_id, source, kind), vals in by.items():
         n = len(vals)
+        if n == 0:
+            continue
+
         errors = [v[0] for v in vals]
         abs_errors = [v[1] for v in vals]
 
@@ -416,15 +422,17 @@ def update_error_stats(*, window_days: int, station_id: Optional[str] = None) ->
               n=excluded.n, bias=excluded.bias, mae=excluded.mae, rmse=excluded.rmse,
               p10=excluded.p10, p50=excluded.p50, p90=excluded.p90, last_updated=excluded.last_updated
             """,
-            (station_id, source, kind, window_days, n, bias, mae, rmse, p10, p50, p90, now_ts),
+            (st_id, source, kind, window_days, n, bias, mae, rmse, p10, p50, p90, now_ts),
         )
 
-    # combined ("both") = mean(MAE_high, MAE_low)
-    for source in sorted(set(k[0] for k in by.keys())):
-        highs = by.get((source, "high"), [])
-        lows = by.get((source, "low"), [])
+    # combined ("both") per station+source = mean(MAE_high, MAE_low)
+    stations_sources = sorted({(k[0], k[1]) for k in by.keys()})
+    for st_id, source in stations_sources:
+        highs = by.get((st_id, source, "high"), [])
+        lows = by.get((st_id, source, "low"), [])
         if not highs or not lows:
             continue
+
         mae_high = sum(v[1] for v in highs) / len(highs)
         mae_low = sum(v[1] for v in lows) / len(lows)
         mae_both = (mae_high + mae_low) / 2.0
@@ -438,11 +446,12 @@ def update_error_stats(*, window_days: int, station_id: Optional[str] = None) ->
             on conflict (station_id, source, kind, window_days) do update set
               n=excluded.n, mae=excluded.mae, last_updated=excluded.last_updated
             """,
-            (station_id, source, window_days, n, mae_both, now_ts),
+            (st_id, source, window_days, n, mae_both, now_ts),
         )
 
     conn.commit()
     conn.close()
+
 
 
 
