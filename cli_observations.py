@@ -46,7 +46,6 @@ def fetch_observations_for_station(station: dict, target_date: str) -> bool:
         "is_active": station.get("is_active"),
     })
     
-    issued_at = now()
     target = date.fromisoformat(target_date)
     tz = ZoneInfo(station.get("timezone") or "UTC")
 
@@ -99,6 +98,7 @@ def fetch_observations(target_date: str) -> bool:
         except Exception as e:
             print(f"[obs] FAIL {st.get('station_id')} {target_date}: {e}")
     return any_ok
+
 
 
 
