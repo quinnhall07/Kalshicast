@@ -271,20 +271,32 @@ def fetch_observations_for_station(station: dict, target_date: str) -> bool:
         }
     )
 
-    lat = station.get("lat")
-    lon = station.get("lon")
-
     # What we expect to see in the CLI text (e.g., CLIMDW)
-    cli_site = (station.get("cli_site") or (station_id[1:] if station_id.startswith("K") and len(station_id) == 4 else station_id)).upper()
+    cli_site = (
+        station.get("cli_site")
+        or (station_id[1:] if station_id.startswith("K") and len(station_id) == 4 else station_id)
+    ).upper().strip()
+
+    # Location IDs to try for the CLI endpoint.
+    # Priority: explicit config -> heuristic from station_id.
+    loc_ids: List[str] = []
+    if cli_site:
+        loc_ids.append(cli_site)
+
+    # Optional overrides if you add them later
+    if station.get("cli_location_id"):
+        loc_ids.append(str(station["cli_location_id"]).upper().strip())
+
+    # Common heuristic: KMDW -> MDW (already handled by cli_site default above, but keep as safety)
+    if station_id.startswith("K") and len(station_id) == 4:
+        loc_ids.append(station_id[1:])
+
+    # de-dupe while preserving order
+    seen = set()
+    loc_ids = [x for x in loc_ids if x and not (x in seen or seen.add(x))]
 
     # CLI path (list -> product -> parse)
     try:
-        if lat is None or lon is None:
-            raise ValueError("missing lat/lon (required for CLI lookup)")
-        cwa = _get_cwa(float(lat), float(lon))
-
-        loc_ids = _candidate_location_ids(station, cwa)
-
         last_cli_err: Optional[Exception] = None
 
         for loc in loc_ids:
@@ -293,10 +305,8 @@ def fetch_observations_for_station(station: dict, target_date: str) -> bool:
                 if not items:
                     raise ValueError(f"no CLI products for locationId={loc}")
 
-                # Newest first
                 items_sorted = sorted(items, key=_issuance_sort_key, reverse=True)
 
-                # Try up to N most recent products
                 for it in items_sorted[:30]:
                     pid = it.get("id") or it.get("@id")
                     if not isinstance(pid, str) or not pid.strip():
@@ -366,4 +376,5 @@ def fetch_observations(target_date: str) -> bool:
         except Exception as e:
             print(f"[obs] FAIL {st.get('station_id')} {target_date}: {e}")
     return any_ok
+
 
