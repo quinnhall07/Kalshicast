@@ -15,7 +15,7 @@ TARGET_LOCAL_HOUR_LOW = 7    # ~7am local
 STATIONS = [
     {
         "station_id": "KNYC",
-        "cli_site": station_id[1:],
+        "cli_site": "NYC",
         "name": "NYC Central Park",
         "state": "NY",
         "timezone": "America/New_York",
@@ -26,7 +26,7 @@ STATIONS = [
     },
     {
         "station_id": "KMIA",
-        "cli_site": station_id[1:],
+        "cli_site": "MIA",
         "name": "Miami International Airport",
         "state": "FL",
         "timezone": "America/New_York",
@@ -37,7 +37,7 @@ STATIONS = [
     },
     {
         "station_id": "KMSY",
-        "cli_site": station_id[1:],
+        "cli_site": "MSY",
         "name": "New Orleans International Airport",
         "state": "LA",
         "timezone": "America/Chicago",
@@ -48,7 +48,7 @@ STATIONS = [
     },
     {
         "station_id": "KPHL",
-        "cli_site": station_id[1:],
+        "cli_site": "PHL",
         "name": "Philadelphia International Airport",
         "state": "PA",
         "timezone": "America/New_York",
@@ -59,7 +59,7 @@ STATIONS = [
     },
     {
         "station_id": "KMDW",
-        "cli_site": station_id[1:],
+        "cli_site": "MDW",
         "name": "Chicago Midway Airport",
         "state": "IL",
         "timezone": "America/Chicago",
@@ -70,7 +70,7 @@ STATIONS = [
     },
     {
         "station_id": "KLAX",
-        "cli_site": station_id[1:],
+        "cli_site": "LAX",
         "name": "Los Angeles International Airport",
         "state": "CA",
         "timezone": "America/Los_Angeles",
@@ -81,7 +81,7 @@ STATIONS = [
     },
     {
         "station_id": "KAUS",
-        "cli_site": station_id[1:],
+        "cli_site": "AUS",
         "name": "Austin-Bergstrom International Airport",
         "state": "TX",
         "timezone": "America/Chicago",
@@ -92,7 +92,7 @@ STATIONS = [
     },
     {
         "station_id": "KDEN",
-        "cli_site": station_id[1:],
+        "cli_site": "DEN",
         "name": "Denver International Airport",
         "state": "CO",
         "timezone": "America/Denver",
@@ -103,7 +103,7 @@ STATIONS = [
     },
     {
         "station_id": "KSEA",
-        "cli_site": station_id[1:],
+        "cli_site": "SEA",
         "name": "Seattle-Tacoma International Airport",
         "state": "WA",
         "timezone": "America/Los_Angeles",
@@ -114,7 +114,7 @@ STATIONS = [
     },
     {
         "station_id": "KLAS",
-        "cli_site": station_id[1:],
+        "cli_site": "LAS",
         "name": "Harry Reid International Airport",
         "state": "NV",
         "timezone": "America/Los_Angeles",
@@ -125,7 +125,7 @@ STATIONS = [
     },
     {
         "station_id": "KSFO",
-        "cli_site": station_id[1:],
+        "cli_site": "SFO",
         "name": "San Francisco International Airport",
         "state": "CA",
         "timezone": "America/Los_Angeles",
@@ -136,7 +136,7 @@ STATIONS = [
     },
     {
         "station_id": "KDCA",
-        "cli_site": station_id[1:],
+        "cli_site": "DCA",
         "name": "Reagan National Airport",
         "state": "VA",
         "timezone": "America/New_York",
@@ -215,6 +215,7 @@ SOURCES = {
     },
 
 }
+
 
 
 
