@@ -5,31 +5,43 @@ from db import get_conn
 
 
 def reset_db() -> None:
+    # Truncate only tables that actually exist (avoids failures when optional tables aren't migrated yet)
+    candidates = [
+        # Optional / newer
+        "public.forecast_revisions",
+        "public.observations_v2",
+        "public.observation_runs",
+        "public.observations_latest",
+        "public.forecasts_hourly",
+        "public.forecast_extras_hourly",
+        # Core
+        "public.forecast_errors",
+        "public.error_stats",
+        "public.forecasts",
+        "public.forecast_runs",
+        "public.observations",
+        "public.locations",
+    ]
+
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                TRUNCATE TABLE
-                    -- Forecast side
-                    forecast_extras_hourly,
-                    forecasts_daily,
-                    forecast_revisions,
-                    forecast_errors,
-                    error_stats,
-                    forecasts,
-                    forecast_runs,
+            existing: list[str] = []
+            for t in candidates:
+                # to_regclass returns NULL if the relation doesn't exist
+                cur.execute("select to_regclass(%s)", (t,))
+                if cur.fetchone()[0] is not None:
+                    existing.append(t)
 
-                    -- Observation side
-                    observations_v2,
-                    observation_runs,
-                    observations,
+            if not existing:
+                print("No known tables exist; nothing to reset.")
+                return
 
-                    -- Core
-                    locations
-                RESTART IDENTITY CASCADE;
-            """)
+            sql = "TRUNCATE TABLE " + ", ".join(existing) + " RESTART IDENTITY CASCADE;"
+            cur.execute(sql)
+
         conn.commit()
 
-    print("Postgres reset complete.")
+    print(f"Postgres reset complete. Truncated {len(existing)} tables.")
 
 
 if __name__ == "__main__":
