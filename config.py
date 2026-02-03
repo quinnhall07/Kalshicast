@@ -165,10 +165,10 @@ SOURCES = {
     },
 
     # Models as separate sources
-    "OME_GFS":  {"name":"Open-Meteo GFS",   "enabled": True, "module":"collectors.collect_ome_model", "func":"fetch_openmeteo_model_forecast", "params":{"model":"gfs"}},
-    "OME_EC":   {"name":"Open-Meteo ECMWF", "enabled": True, "module":"collectors.collect_ome_model", "func":"fetch_openmeteo_model_forecast", "params":{"model":"ecmwf"}},
-    "OME_ICON": {"name":"Open-Meteo ICON",  "enabled": True, "module":"collectors.collect_ome_model", "func":"fetch_openmeteo_model_forecast", "params":{"model":"icon"}},
-    "OME_GEM":  {"name":"Open-Meteo GEM",   "enabled": True, "module":"collectors.collect_ome_model", "func":"fetch_openmeteo_model_forecast", "params":{"model":"gem"}},
+    "OME_GFS":  {"name":"Open-Meteo GFS",   "enabled": True, "module":"collectors.collect_ome_model", "func":"fetch_open_model_forecast", "params":{"model":"gfs"}},
+    "OME_EC":   {"name":"Open-Meteo ECMWF", "enabled": True, "module":"collectors.collect_ome_model", "func":"fetch_open_model_forecast", "params":{"model":"ecmwf"}},
+    "OME_ICON": {"name":"Open-Meteo ICON",  "enabled": True, "module":"collectors.collect_ome_model", "func":"fetch_open_model_forecast", "params":{"model":"icon"}},
+    "OME_GEM":  {"name":"Open-Meteo GEM",   "enabled": True, "module":"collectors.collect_ome_model", "func":"fetch_open_model_forecast", "params":{"model":"gem"}},
 
     #WeatherAPI
     "WAPI": {
@@ -215,6 +215,7 @@ SOURCES = {
     },
 
 }
+
 
 
 
