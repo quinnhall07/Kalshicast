@@ -1,26 +1,22 @@
-# collect_ome.py
+# collectors/collect_ome.py  (OME_BASE)
 from __future__ import annotations
 
 import requests
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from config import HEADERS
 
 OME_URL = "https://api.open-meteo.com/v1/forecast"
 
-# -------------------------
-# Daily vars (kept minimal; ML-grade features come from hourly)
-# -------------------------
+# 3-day horizon (instead of 2): today + next 2 days = 3 target dates
+HORIZON_DAYS = 3
+
 _DAILY_VARS = [
     "temperature_2m_max",
     "temperature_2m_min",
 ]
 
-# -------------------------
-# Hourly vars (for forecast_extras_hourly; NO aggregation)
-# Use Open-Meteo's standard names.
-# -------------------------
 _HOURLY_VARS = [
     "temperature_2m",
     "dew_point_2m",
@@ -38,16 +34,12 @@ def _utc_now_z() -> str:
 
 def fetch_ome_forecast(station: dict, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
-    Returns payload compatible with morning.py:
+    STRICT payload shape (consumed by morning.py):
       {
         "issued_at": "...Z",
-        "rows": [ {target_date, high, low, extras?}, ... ],          # daily
-        "hourly": { "time": [...], "<var>": [...], ... } OR
-        "hourly_rows": [ {valid_time, temperature_f, dewpoint_f, ...}, ... ]  # optional
+        "daily": [ {"target_date":"YYYY-MM-DD","high_f":float,"low_f":float}, ... ],
+        "hourly": { "time":[...], "<var>":[...], ... }   # Open-Meteo arrays (unaggregated)
       }
-
-    We use Open-Meteo arrays under "hourly" to avoid inflating payload size in Python.
-    morning.py normalizes + stores hourly rows without aggregating.
     """
     lat = station.get("lat")
     lon = station.get("lon")
@@ -55,7 +47,7 @@ def fetch_ome_forecast(station: dict, params: Optional[Dict[str, Any]] = None) -
         raise ValueError("Open-Meteo fetch requires station['lat'] and station['lon'].")
 
     today = date.today()
-    tomorrow = date.fromordinal(today.toordinal() + 1)
+    end_date = today + timedelta(days=HORIZON_DAYS - 1)  # inclusive
 
     q: Dict[str, Any] = {
         "latitude": float(lat),
@@ -64,9 +56,9 @@ def fetch_ome_forecast(station: dict, params: Optional[Dict[str, Any]] = None) -
         # daily highs/lows
         "daily": ",".join(_DAILY_VARS),
         "start_date": today.isoformat(),
-        "end_date": tomorrow.isoformat(),
+        "end_date": end_date.isoformat(),
 
-        # hourly, unaggregated features for ML later
+        # hourly, unaggregated features
         "hourly": ",".join(_HOURLY_VARS),
 
         # consistent units
@@ -87,37 +79,29 @@ def fetch_ome_forecast(station: dict, params: Optional[Dict[str, Any]] = None) -
 
     issued_at = _utc_now_z()
 
-    # -------------------------
-    # Daily rows
-    # -------------------------
+    # ---- daily list ----
     daily = data.get("daily") or {}
     dates = daily.get("time") or []
     tmax = daily.get("temperature_2m_max") or []
     tmin = daily.get("temperature_2m_min") or []
 
-    rows: List[dict] = []
+    out_daily: List[dict] = []
     if isinstance(dates, list) and dates:
         n = min(len(dates), len(tmax), len(tmin))
         for i in range(n):
             td = str(dates[i])[:10]
             try:
-                high = float(tmax[i])
-                low = float(tmin[i])
+                high_f = float(tmax[i])
+                low_f = float(tmin[i])
             except Exception:
                 continue
-            rows.append({"target_date": td, "high": high, "low": low})
+            out_daily.append({"target_date": td, "high_f": high_f, "low_f": low_f})
 
-    # -------------------------
-    # Hourly arrays (preferred shape)
-    # -------------------------
+    # ---- hourly arrays ----
     hourly = data.get("hourly")
-    hourly_out: Optional[dict] = None
-    if isinstance(hourly, dict) and isinstance(hourly.get("time"), list) and hourly["time"]:
-        # Pass through as-is; morning.py handles aligning by index + mapping to standardized columns.
-        hourly_out = hourly
+    out: Dict[str, Any] = {"issued_at": issued_at, "daily": out_daily}
 
-    out: Dict[str, Any] = {"issued_at": issued_at, "rows": rows}
-    if hourly_out is not None:
-        out["hourly"] = hourly_out
+    if isinstance(hourly, dict) and isinstance(hourly.get("time"), list) and hourly["time"]:
+        out["hourly"] = hourly
 
     return out
