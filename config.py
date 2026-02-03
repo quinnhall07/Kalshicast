@@ -152,7 +152,7 @@ SOURCES = {
     "NWS": {
         "name": "National Weather Service",
         "enabled": True,
-        "module": "collect_nws",
+        "module": "collectors.collect_nws",
         "func": "fetch_nws_forecast",
     },
     # Open-Meteo base
@@ -165,56 +165,57 @@ SOURCES = {
     },
 
     # Models as separate sources
-    "OME_GFS":  {"name":"Open-Meteo GFS",   "enabled": True, "module":"collect_ome_model", "func":"fetch_openmeteo_model_forecast", "params":{"model":"gfs"}},
-    "OME_EC":   {"name":"Open-Meteo ECMWF", "enabled": True, "module":"collect_ome_model", "func":"fetch_openmeteo_model_forecast", "params":{"model":"ecmwf"}},
-    "OME_ICON": {"name":"Open-Meteo ICON",  "enabled": True, "module":"collect_ome_model", "func":"fetch_openmeteo_model_forecast", "params":{"model":"icon"}},
-    "OME_GEM":  {"name":"Open-Meteo GEM",   "enabled": True, "module":"collect_ome_model", "func":"fetch_openmeteo_model_forecast", "params":{"model":"gem"}},
+    "OME_GFS":  {"name":"Open-Meteo GFS",   "enabled": True, "module":"collectors.collect_ome_model", "func":"fetch_openmeteo_model_forecast", "params":{"model":"gfs"}},
+    "OME_EC":   {"name":"Open-Meteo ECMWF", "enabled": True, "module":"collectors.collect_ome_model", "func":"fetch_openmeteo_model_forecast", "params":{"model":"ecmwf"}},
+    "OME_ICON": {"name":"Open-Meteo ICON",  "enabled": True, "module":"collectors.collect_ome_model", "func":"fetch_openmeteo_model_forecast", "params":{"model":"icon"}},
+    "OME_GEM":  {"name":"Open-Meteo GEM",   "enabled": True, "module":"collectors.collect_ome_model", "func":"fetch_openmeteo_model_forecast", "params":{"model":"gem"}},
 
     #WeatherAPI
     "WAPI": {
         "name": "WeatherAPI",
         "enabled": True,  # flip to True when your scraper is stable
-        "module": "collect_wapi",
+        "module": "collectors.collect_wapi",
         "func": "fetch_wapi_forecast",
     },
     #NOAA GFS
     "NGFS": {
         "name": "NOAA GFS",
         "enabled": False,  # flip to True when your scraper is stable
-        "module": "collect_ngfs",
+        "module": "collectors.collect_ngfs",
         "func": "fetch_ngfs_forecast",
     },
     #NOAA HRRR
     "NHR3": {
         "name": "NOAA HRRR",
         "enabled": False,  # flip to True when your scraper is stable
-        "module": "collect_nhr3",
+        "module": "collectors.collect_nhr3",
         "func": "fetch_nhr3_forecast",
     },
     #Visual Crossing
     "VCR": {
         "name": "Visual Crossing",
         "enabled": True,  # flip to True when your scraper is stable
-        "module": "collect_vcr",
+        "module": "collectors.collect_vcr",
         "func": "fetch_vcr_forecast",
         "params": {
             "unitGroup": "us",
-            "days": 2,
+            "days": 3,
         },
     },
     #Tomorrow.io
     "TOM": {
         "name": "Tomorrow.io",
         "enabled": True,
-        "module": "collect_tom",
+        "module": "collectors.collect_tom",
         "func": "fetch_tom_forecast",
         "params": {
-            "days": 2,        # today + tomorrow
+            "days": 3,        # today + tomorrow
             "units": "imperial",
         },
     },
 
 }
+
 
 
 
