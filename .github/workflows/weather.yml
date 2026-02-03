@@ -1,3 +1,4 @@
+# weather.yml
 name: Weather pipeline
 
 on:
@@ -62,7 +63,6 @@ jobs:
       WEATHERAPI_KEY: ${{ secrets.WEATHERAPI_KEY }}
       VISUALCROSSING_KEY: ${{ secrets.VISUALCROSSING_KEY }}
 
-      # Debug envs (only populated for workflow_dispatch runs)
       DEBUG_DUMP: ${{ github.event.inputs.debug_dump }}
       DEBUG_SOURCE: ${{ github.event.inputs.debug_source }}
       DEBUG_STATION: ${{ github.event.inputs.debug_station }}
@@ -98,7 +98,6 @@ jobs:
       WEATHERAPI_KEY: ${{ secrets.WEATHERAPI_KEY }}
       VISUALCROSSING_KEY: ${{ secrets.VISUALCROSSING_KEY }}
 
-      # Debug envs (only populated for workflow_dispatch runs)
       DEBUG_DUMP: ${{ github.event.inputs.debug_dump }}
       DEBUG_SOURCE: ${{ github.event.inputs.debug_source }}
       DEBUG_STATION: ${{ github.event.inputs.debug_station }}
