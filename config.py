@@ -159,7 +159,7 @@ SOURCES = {
     "OME_BASE": {
         "name": "Open-Meteo (default)",
         "enabled": True,
-        "module": "collect_ome",
+        "module": "collectors.collect_ome",
         "func": "fetch_ome_forecast",
         "params": {"model": "best"},
     },
@@ -215,6 +215,7 @@ SOURCES = {
     },
 
 }
+
 
 
 
