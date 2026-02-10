@@ -199,7 +199,7 @@ SOURCES = {
         "func": "fetch_vcr_forecast",
         "params": {
             "unitGroup": "us",
-            "days": 3,
+            "days": 4,
         },
     },
     #Tomorrow.io
@@ -209,12 +209,13 @@ SOURCES = {
         "module": "collectors.collect_tom",
         "func": "fetch_tom_forecast",
         "params": {
-            "days": 3,        # today + tomorrow
+            "days": 4,        # today + tomorrow
             "units": "imperial",
         },
     },
 
 }
+
 
 
 
