@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 from datetime import date, datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -11,9 +11,31 @@ from config import HEADERS
 
 VCR_URL = "https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline"
 
+"""
+STRICT payload shape required by sources_registry + morning.py:
 
-def _utc_now_z() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+{
+  "issued_at": "...Z",
+  "daily": [
+    {"target_date": "YYYY-MM-DD", "high_f": float, "low_f": float},
+    ...
+  ],
+  "hourly": {                     # optional
+    "time": ["YYYY-MM-DDTHH:MM:00Z", ...],
+    "temperature_f": [float|None, ...],
+    "dewpoint_f": [float|None, ...],
+    "humidity_pct": [float|None, ...],
+    "wind_speed_mph": [float|None, ...],
+    "wind_dir_deg": [float|None, ...],
+    "cloud_cover_pct": [float|None, ...],
+    "precip_prob_pct": [float|None, ...],
+  }
+}
+"""
+
+def _utc_now_trunc_hour_z() -> str:
+    now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    return now.isoformat().replace("+00:00", "Z")
 
 
 def _get_key() -> str:
@@ -23,20 +45,42 @@ def _get_key() -> str:
     return key
 
 
+def _to_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def _epoch_to_time_z(epoch: Any) -> Optional[str]:
+    """
+    Visual Crossing 'hours' can provide datetimeEpoch (seconds since epoch).
+    Prefer that to avoid timezone ambiguity.
+    """
+    if epoch is None:
+        return None
+    try:
+        dt = datetime.fromtimestamp(float(epoch), tz=timezone.utc)
+        dt = dt.replace(second=0, microsecond=0)
+        return dt.isoformat().replace("+00:00", "Z")
+    except Exception:
+        return None
+
+
 def fetch_vcr_forecast(station: dict, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """
-    Strict payload shape:
-      {
-        "issued_at": "...Z",
-        "rows": [
-          {"target_date": "YYYY-MM-DD", "high": float, "low": float, "extras": {...}},
-          ...
-        ]
-      }
+    Visual Crossing collector -> STRICT payload.
+
+    Params:
+      - days_ahead: int (default 3) meaning today..today+days_ahead inclusive (so 3 -> 4 days)
+      - include_hourly: bool (default True)
 
     Notes:
-      - Default horizon: 3 days (today + next 2 days)
-      - Extras are daily aggregates from Visual Crossing if available.
+      - unitGroup=us returns Fahrenheit, mph, etc.
+      - issued_at: no reliable model-run timestamp; use fetch time truncated to hour UTC.
+      - hourly: uses datetimeEpoch for UTC-safe timestamps.
     """
     params = params or {}
 
@@ -47,21 +91,31 @@ def fetch_vcr_forecast(station: dict, params: Dict[str, Any] | None = None) -> D
 
     key = _get_key()
 
-    ndays = int(params.get("days", 3))
-    if ndays < 1:
-        ndays = 1
+    days_ahead = 3
+    if params.get("days_ahead") is not None:
+        try:
+            days_ahead = int(params["days_ahead"])
+        except Exception:
+            pass
+    days_ahead = max(0, min(14, days_ahead))
+
+    include_hourly = True
+    if params.get("include_hourly") is not None:
+        include_hourly = bool(params["include_hourly"])
 
     base = date.today()
+    ndays = days_ahead + 1
+
     start = base.isoformat()
-    end = date.fromordinal(base.toordinal() + (ndays - 1)).isoformat()
+    end = date.fromordinal(base.toordinal() + days_ahead).isoformat()
     want = {date.fromordinal(base.toordinal() + i).isoformat() for i in range(ndays)}
 
-    # unitGroup=us returns Fahrenheit, mph, etc.
     q = {
         "unitGroup": "us",
         "key": key,
         "contentType": "json",
-        "include": "days",
+        # If hourly desired, ask for both; otherwise days only.
+        "include": "days,hours" if include_hourly else "days",
     }
 
     url = f"{VCR_URL}/{float(lat)},{float(lon)}/{start}/{end}"
@@ -69,58 +123,69 @@ def fetch_vcr_forecast(station: dict, params: Dict[str, Any] | None = None) -> D
     r.raise_for_status()
     data = r.json()
 
+    issued_at = _utc_now_trunc_hour_z()
+
     days = data.get("days") or []
-    rows: List[Dict[str, Any]] = []
+    daily: List[Dict[str, Any]] = []
 
-    for drec in days:
-        d = str(drec.get("datetime") or "")[:10]
-        if not d or d not in want:
-            continue
+    hourly_out: Dict[str, List[Any]] = {
+        "time": [],
+        "temperature_f": [],
+        "dewpoint_f": [],
+        "humidity_pct": [],
+        "wind_speed_mph": [],
+        "wind_dir_deg": [],
+        "cloud_cover_pct": [],
+        "precip_prob_pct": [],
+    }
 
-        try:
-            hi = float(drec.get("tempmax"))
-            lo = float(drec.get("tempmin"))
-        except Exception:
-            continue
+    if isinstance(days, list):
+        for drec in days:
+            if not isinstance(drec, dict):
+                continue
+            d = str(drec.get("datetime") or "")[:10]
+            if not d or d not in want:
+                continue
 
-        extras: Dict[str, Any] = {}
+            hi = _to_float(drec.get("tempmax"))
+            lo = _to_float(drec.get("tempmin"))
+            if hi is not None and lo is not None:
+                daily.append({"target_date": d, "high_f": float(hi), "low_f": float(lo)})
 
-        v = drec.get("humidity")
-        if v is not None:
-            try:
-                extras["humidity_pct"] = float(v)
-            except Exception:
-                pass
+            if not include_hourly:
+                continue
 
-        v = drec.get("windspeed")
-        if v is not None:
-            try:
-                extras["wind_speed_mph"] = float(v)
-            except Exception:
-                pass
+            hours = drec.get("hours") or []
+            if not isinstance(hours, list):
+                continue
 
-        v = drec.get("winddir")
-        if v is not None:
-            try:
-                extras["wind_dir_deg"] = float(v)
-            except Exception:
-                pass
+            for h in hours:
+                if not isinstance(h, dict):
+                    continue
 
-        v = drec.get("cloudcover")
-        if v is not None:
-            try:
-                extras["cloud_cover_pct"] = float(v)
-            except Exception:
-                pass
+                t = _epoch_to_time_z(h.get("datetimeEpoch"))
+                if t is None:
+                    # fallback: Visual Crossing can also provide datetime like "2026-02-10T01:00:00"
+                    # but timezone can be ambiguous; skip if epoch missing.
+                    continue
 
-        # Visual Crossing provides precipprob in some plans/fields; keep if present.
-        v = drec.get("precipprob")
-        if v is not None:
-            try:
-                extras["precip_prob_pct"] = float(v)
-            except Exception:
-                pass
+                hourly_out["time"].append(t)
+                hourly_out["temperature_f"].append(_to_float(h.get("temp")))
+                hourly_out["dewpoint_f"].append(_to_float(h.get("dew")))
+                hourly_out["humidity_pct"].append(_to_float(h.get("humidity")))
+                hourly_out["wind_speed_mph"].append(_to_float(h.get("windspeed")))
+                hourly_out["wind_dir_deg"].append(_to_float(h.get("winddir")))
+                hourly_out["cloud_cover_pct"].append(_to_float(h.get("cloudcover")))
+                hourly_out["precip_prob_pct"].append(_to_float(h.get("precipprob")))
 
-        rows.append({"target_date": d, "high": hi, "low": lo, "extras": extras})
+    out: Dict[str, Any] = {"issued_at": issued_at, "daily": daily}
 
-    return {"issued_at": _utc_now_z(), "rows": rows}
+    if hourly_out["time"]:
+        # Truncate all arrays to min length to guarantee alignment
+        min_len = min(len(v) for v in hourly_out.values())
+        if min_len > 0:
+            for k in list(hourly_out.keys()):
+                hourly_out[k] = hourly_out[k][:min_len]
+            out["hourly"] = hourly_out
+
+    return out
