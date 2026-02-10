@@ -75,18 +75,32 @@ def _print(msg: str) -> None:
 def _bridge_db_env() -> None:
     """
     Ensure db.py sees the correct env var.
-    In CI we pass DATABASE_URL; locally you can set either.
+
+    Supports:
+      - local: WEATHER_DB_URL or DATABASE_URL
+      - CI: secrets exported as WEATHER_DB_URL or DATABASE_URL
     """
+    # If db.py-required var already set, nothing to do.
     env_var = POLICY.db_env_var
-    if os.getenv(env_var):
+    if (os.getenv(env_var) or "").strip():
         return
 
-    v = (os.getenv(POLICY.ci_db_secret_env) or os.getenv("DATABASE_URL") or "").strip()
-    if v:
-        os.environ[env_var] = v
-        return
+    # Accept either common env var name.
+    candidates = [
+        env_var,                     # WEATHER_DB_URL
+        "WEATHER_DB_URL",            # explicit
+        "DATABASE_URL",              # common in CI
+        POLICY.ci_db_secret_env,     # DATABASE_URL (per Policy)
+    ]
+
+    for k in candidates:
+        v = (os.getenv(k) or "").strip()
+        if v:
+            os.environ[env_var] = v
+            return
 
     raise RuntimeError("Missing WEATHER_DB_URL (or DATABASE_URL) for Supabase Postgres.")
+
 
 
 def _is_due(now_utc: datetime) -> Tuple[bool, datetime, timedelta]:
