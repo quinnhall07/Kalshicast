@@ -1,134 +1,118 @@
 # rollover.py
 from __future__ import annotations
 
-import argparse
-import json
+import os
+import sys
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
-import os
-import yaml
+from typing import Tuple
+
+from croniter import croniter
+
 from db import get_conn
 
 """
-Rolling deletion / retention policy.
+Rolling deletion / retention policy + schedule gate.
 
-Single source of truth:
-  rollover_config.json
+Single source of truth: THIS FILE.
 
-GitHub Actions should NOT repeat retention knobs. It should just run:
-  python rollover.py --config rollover_config.json
+How it runs in GitHub Actions:
+- Workflow triggers every N minutes (poll).
+- This script checks whether the configured cron schedule is "due" within the poll window.
+- If not due, it prints SKIP and exits 0.
+- If due, it performs rolling deletion.
 
-Notes:
-- Uses UTC for all cutoffs.
-- Batched deletes use CTID (works even with composite PKs).
-- Parent run tables are deleted only if OLD and ORPHANED.
+DB env var:
+- db.py requires WEATHER_DB_URL (or DATABASE_URL).
+- This script expects DATABASE_URL in CI and will export it into WEATHER_DB_URL automatically.
 """
 
 
-# -----------------------------
-# Config loading
-# -----------------------------
+# =========================
+# EDIT KNOBS HERE (ONLY)
+# =========================
+
 @dataclass(frozen=True)
-class RolloverConfig:
+class Policy:
+    # The real schedule (evaluated in UTC)
+    cron_utc: str = "25 7 * * *"  # daily at 07:25 UTC
+
+    # Must be >= the workflow poll interval (minutes)
+    poll_window_minutes: int = 16
+
     # Retention windows (days)
-    retain_hourly_days: int
-    retain_daily_days: int
-    retain_errors_days: int
-    retain_observations_days: int
-    retain_forecast_runs_days: int
-    retain_observation_runs_days: int
+    retain_hourly_days: int = 45          # forecast_extras_hourly (largest)
+    retain_daily_days: int = 45           # forecasts_daily
+    retain_errors_days: int = 365         # forecast_errors
+    retain_observations_days: int = 3650  # observations (ground truth)
+    retain_forecast_runs_days: int = 365
+    retain_observation_runs_days: int = 365
 
     # Ops knobs
-    dry_run: bool
-    verbose: bool
-    batch_limit: int
-    max_batches_per_table: int
+    dry_run: bool = False
+    verbose: bool = True
+    batch_limit: int = 50_000
+    max_batches_per_table: int = 50
+
+    # DB wiring
+    # db.py expects WEATHER_DB_URL (or DATABASE_URL); we standardize on WEATHER_DB_URL
+    db_env_var: str = "WEATHER_DB_URL"
+    ci_db_secret_env: str = "DATABASE_URL"  # what workflow exports
 
 
-DEFAULT_CONFIG = RolloverConfig(
-    retain_hourly_days=180,
-    retain_daily_days=365,
-    retain_errors_days=3650,
-    retain_observations_days=3650,
-    retain_forecast_runs_days=3650,
-    retain_observation_runs_days=3650,
-    dry_run=False,
-    verbose=True,
-    batch_limit=50_000,
-    max_batches_per_table=50,
-)
+POLICY = Policy()
 
 
-def _load_config(path: str) -> RolloverConfig:
-    p = Path(path)
-    if not p.exists():
-        return DEFAULT_CONFIG
+# =========================
+# Helpers
+# =========================
 
-    data = json.loads(p.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        return DEFAULT_CONFIG
-
-    def gi(name: str, default: int) -> int:
-        v = data.get(name, default)
-        try:
-            return int(v)
-        except Exception:
-            return default
-
-    def gb(name: str, default: bool) -> bool:
-        v = data.get(name, default)
-        if isinstance(v, bool):
-            return v
-        if isinstance(v, str):
-            return v.strip().lower() in ("1", "true", "yes", "y", "on")
-        return bool(v)
-
-    return RolloverConfig(
-        retain_hourly_days=gi("retain_hourly_days", DEFAULT_CONFIG.retain_hourly_days),
-        retain_daily_days=gi("retain_daily_days", DEFAULT_CONFIG.retain_daily_days),
-        retain_errors_days=gi("retain_errors_days", DEFAULT_CONFIG.retain_errors_days),
-        retain_observations_days=gi("retain_observations_days", DEFAULT_CONFIG.retain_observations_days),
-        retain_forecast_runs_days=gi("retain_forecast_runs_days", DEFAULT_CONFIG.retain_forecast_runs_days),
-        retain_observation_runs_days=gi("retain_observation_runs_days", DEFAULT_CONFIG.retain_observation_runs_days),
-        dry_run=gb("dry_run", DEFAULT_CONFIG.dry_run),
-        verbose=gb("verbose", DEFAULT_CONFIG.verbose),
-        batch_limit=gi("batch_limit", DEFAULT_CONFIG.batch_limit),
-        max_batches_per_table=gi("max_batches_per_table", DEFAULT_CONFIG.max_batches_per_table),
-    )
-
-
-def _print(msg: str, cfg: RolloverConfig) -> None:
-    if cfg.verbose:
+def _print(msg: str) -> None:
+    if POLICY.verbose:
         print(msg, flush=True)
 
 
-# -----------------------------
-# Batched delete helper (CTID)
-# -----------------------------
-def _delete_batched(
-    *,
-    table: str,
-    where_sql: str,
-    params: tuple,
-    cfg: RolloverConfig,
-    label: str,
-) -> int:
+def _bridge_db_env() -> None:
     """
-    Deletes in batches using CTID selection so it works with composite keys.
+    Ensure db.py sees the correct env var.
+    In CI we pass DATABASE_URL; locally you can set either.
+    """
+    env_var = POLICY.db_env_var
+    if os.getenv(env_var):
+        return
+
+    v = (os.getenv(POLICY.ci_db_secret_env) or os.getenv("DATABASE_URL") or "").strip()
+    if v:
+        os.environ[env_var] = v
+        return
+
+    raise RuntimeError("Missing WEATHER_DB_URL (or DATABASE_URL) for Supabase Postgres.")
+
+
+def _is_due(now_utc: datetime) -> Tuple[bool, datetime, timedelta]:
+    """
+    Stateless schedule gate:
+    - compute previous scheduled time <= now
+    - run only if it occurred within poll window
+    """
+    it = croniter(POLICY.cron_utc, now_utc)
+    prev_sched = it.get_prev(datetime)
+    delta = now_utc - prev_sched
+    return delta < timedelta(minutes=POLICY.poll_window_minutes), prev_sched, delta
+
+
+def _delete_batched(*, table: str, where_sql: str, params: tuple, label: str) -> int:
+    """
+    Batch delete via CTID so it works with any PK shape.
     Returns total deleted.
     """
-    total = 0
-
-    # Dry run: count only (no batches needed)
-    if cfg.dry_run:
+    if POLICY.dry_run:
         count_sql = f"SELECT count(*) FROM {table} WHERE {where_sql}"
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(count_sql, params)
                 n = int(cur.fetchone()[0])
-        _print(f"[rollover] DRY_RUN {label}: would delete {n}", cfg)
+        _print(f"[rollover] DRY_RUN {label}: would delete {n}")
         return n
 
     delete_sql = f"""
@@ -142,67 +126,53 @@ def _delete_batched(
     WHERE ctid IN (SELECT ctid FROM doomed)
     """
 
+    total = 0
     with get_conn() as conn:
         with conn.cursor() as cur:
-            for batch in range(1, cfg.max_batches_per_table + 1):
-                cur.execute(delete_sql, params + (cfg.batch_limit,))
+            for batch in range(1, POLICY.max_batches_per_table + 1):
+                cur.execute(delete_sql, params + (POLICY.batch_limit,))
                 n = cur.rowcount or 0
                 conn.commit()
                 total += n
-                _print(f"[rollover] OK {label}: batch {batch} deleted {n} (total {total})", cfg)
+                _print(f"[rollover] OK {label}: batch {batch} deleted {n} (total {total})")
                 if n == 0:
                     break
-
     return total
 
 
-def main() -> None:
-    # rollover.py (inside main(), before first DB call)
-    ops_path = Path("ops_config.yml")
-    if ops_path.exists():
-        ops = yaml.safe_load(ops_path.read_text(encoding="utf-8")) or {}
-        env_var = ((ops.get("database") or {}).get("env_var") or "").strip()
-        if env_var:
-            # If DATABASE_URL is set but WEATHER_DB_URL is what db.py expects, copy it over.
-            if os.getenv(env_var) is None and os.getenv("DATABASE_URL"):
-                os.environ[env_var] = os.getenv("DATABASE_URL")
-
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="rollover_config.json", help="Path to rollover JSON config")
-    args = ap.parse_args()
-
-    cfg = _load_config(args.config)
+def main() -> int:
+    _bridge_db_env()
 
     now_utc = datetime.now(timezone.utc)
-    today_utc = now_utc.date()
+    due, prev, delta = _is_due(now_utc)
 
-    hourly_cutoff = now_utc - timedelta(days=max(0, cfg.retain_hourly_days))
-    daily_cutoff_date = today_utc - timedelta(days=max(0, cfg.retain_daily_days))
-    errors_cutoff_date = today_utc - timedelta(days=max(0, cfg.retain_errors_days))
-    obs_cutoff_date = today_utc - timedelta(days=max(0, cfg.retain_observations_days))
-    fr_cutoff = now_utc - timedelta(days=max(0, cfg.retain_forecast_runs_days))
-    or_cutoff = now_utc - timedelta(days=max(0, cfg.retain_observation_runs_days))
+    if not due:
+        _print(f"[rollover] SKIP now={now_utc.isoformat()} prev={prev.isoformat()} delta={delta}")
+        return 0
+
+    # Cutoffs
+    today_utc = now_utc.date()
+    hourly_cutoff = now_utc - timedelta(days=max(0, POLICY.retain_hourly_days))
+    daily_cutoff_date = today_utc - timedelta(days=max(0, POLICY.retain_daily_days))
+    errors_cutoff_date = today_utc - timedelta(days=max(0, POLICY.retain_errors_days))
+    obs_cutoff_date = today_utc - timedelta(days=max(0, POLICY.retain_observations_days))
+    fr_cutoff = now_utc - timedelta(days=max(0, POLICY.retain_forecast_runs_days))
+    or_cutoff = now_utc - timedelta(days=max(0, POLICY.retain_observation_runs_days))
 
     _print(
-        "[rollover] policy "
-        f"hourly<{hourly_cutoff.isoformat()} "
-        f"daily<{daily_cutoff_date.isoformat()} "
-        f"errors<{errors_cutoff_date.isoformat()} "
-        f"obs<{obs_cutoff_date.isoformat()} "
-        f"forecast_runs<{fr_cutoff.isoformat()} "
-        f"observation_runs<{or_cutoff.isoformat()} "
-        f"dry_run={cfg.dry_run} batch_limit={cfg.batch_limit} max_batches={cfg.max_batches_per_table}",
-        cfg,
+        "[rollover] DUE "
+        f"cron={POLICY.cron_utc} prev={prev.isoformat()} "
+        f"hourly<{hourly_cutoff.isoformat()} daily<{daily_cutoff_date.isoformat()} "
+        f"errors<{errors_cutoff_date.isoformat()} obs<{obs_cutoff_date.isoformat()} "
+        f"forecast_runs<{fr_cutoff.isoformat()} observation_runs<{or_cutoff.isoformat()} "
+        f"dry_run={POLICY.dry_run} batch_limit={POLICY.batch_limit} max_batches={POLICY.max_batches_per_table}"
     )
 
-    # ----------------------------
     # 1) Children first
-    # ----------------------------
     _delete_batched(
         table="forecast_extras_hourly",
         where_sql="valid_time < %s",
         params=(hourly_cutoff,),
-        cfg=cfg,
         label="forecast_extras_hourly",
     )
 
@@ -210,7 +180,6 @@ def main() -> None:
         table="forecasts_daily",
         where_sql="target_date < %s",
         params=(daily_cutoff_date,),
-        cfg=cfg,
         label="forecasts_daily",
     )
 
@@ -218,7 +187,6 @@ def main() -> None:
         table="forecast_errors",
         where_sql="target_date < %s",
         params=(errors_cutoff_date,),
-        cfg=cfg,
         label="forecast_errors",
     )
 
@@ -226,14 +194,10 @@ def main() -> None:
         table="observations",
         where_sql="date < %s",
         params=(obs_cutoff_date,),
-        cfg=cfg,
         label="observations",
     )
 
-    # ----------------------------
     # 2) Parent run tables (old + orphaned)
-    # ----------------------------
-    # forecast_runs: issued_at is canonical in your design
     _delete_batched(
         table="forecast_runs fr",
         where_sql="""
@@ -243,11 +207,9 @@ def main() -> None:
           AND NOT EXISTS (SELECT 1 FROM forecast_errors e WHERE e.run_id = fr.id)
         """,
         params=(fr_cutoff,),
-        cfg=cfg,
         label="forecast_runs (orphaned)",
     )
 
-    # observation_runs: assumes created_at exists
     _delete_batched(
         table="observation_runs oru",
         where_sql="""
@@ -255,12 +217,12 @@ def main() -> None:
           AND NOT EXISTS (SELECT 1 FROM observations o WHERE o.run_id = oru.id)
         """,
         params=(or_cutoff,),
-        cfg=cfg,
         label="observation_runs (orphaned)",
     )
 
-    _print("[rollover] done", cfg)
+    _print("[rollover] done")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
