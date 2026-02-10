@@ -34,7 +34,7 @@ DEBUG_STATION = os.getenv("DEBUG_STATION", "").strip()    # exact station_id, e.
 # -------------------------
 # Retry / throttling
 # -------------------------
-MAX_ATTEMPTS = 4
+MAX_ATTEMPTS = 5
 BASE_SLEEP_SECONDS = 0.75
 
 def _env_int(name: str, default: int) -> int:
@@ -442,4 +442,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
