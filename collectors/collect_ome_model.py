@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 import math
+import os
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
 from config import HEADERS
-
 
 OME_URL = "https://api.open-meteo.com/v1/forecast"
 
@@ -24,6 +24,10 @@ Collector contract REQUIRED by morning.py:
 For Open-Meteo, there is no reliable provider-issued timestamp for a forecast “run”.
 Permanent decision: issued_at = fetch time truncated to the hour (UTC).
 """
+
+# Lower timeouts to reduce tail latency + retry storms (morning.py handles retries).
+# Use a (connect, read) timeout tuple for better control.
+DEFAULT_TIMEOUT: Tuple[float, float] = (5.0, 15.0)
 
 
 def _utc_now_trunc_hour_z() -> str:
@@ -51,7 +55,6 @@ def _ensure_time_z(ts: Any) -> Optional[str]:
     if not isinstance(ts, str) or not ts.strip():
         return None
     s = ts.strip()
-    # If already has timezone info, normalize via fromisoformat when possible.
     try:
         if s.endswith("Z"):
             dt = datetime.fromisoformat(s[:-1] + "+00:00")
@@ -62,7 +65,6 @@ def _ensure_time_z(ts: Any) -> Optional[str]:
         dt = dt.astimezone(timezone.utc).replace(second=0, microsecond=0)
         return dt.isoformat().replace("+00:00", "Z")
     except Exception:
-        # Fallback: minimal fix for "YYYY-MM-DDTHH:MM"
         if len(s) >= 16 and s[10] == "T":
             return s[:16] + ":00Z"
         return None
@@ -76,12 +78,13 @@ def fetch_ome_model_forecast(station: dict, params: Optional[Dict[str, Any]] = N
       {"model": "gfs_seamless"} or {"models": "icon_seamless"} depending on Open-Meteo API.
 
     Also supports:
-      - days_ahead: int (default 3; clamped 1..7)
+      - days_ahead: int (default 3; clamped 1..7) meaning today..today+days_ahead inclusive
+        NOTE: your overall project wants a 4-day horizon for WAPI, but Open-Meteo models can remain as configured
+        via params / config. (morning.py does not enforce horizon.)
 
     Returns:
       - daily highs/lows in F: high_f/low_f
-      - hourly arrays object (Open-Meteo native arrays), optionally renamed to standardized keys
-        (morning.py can read either standardized keys or Open-Meteo raw names).
+      - hourly arrays object (Open-Meteo native arrays), with time normalized to "...Z"
     """
     lat = station.get("lat")
     lon = station.get("lon")
@@ -124,7 +127,22 @@ def fetch_ome_model_forecast(station: dict, params: Optional[Dict[str, Any]] = N
     }
     q.update(p)
 
-    r = requests.get(OME_URL, params=q, headers=dict(HEADERS), timeout=25)
+    # Allow overriding timeout via env if needed (e.g., in CI).
+    # Format: "connect,read" or single float for both.
+    timeout = DEFAULT_TIMEOUT
+    env_t = os.getenv("OME_TIMEOUT", "").strip()
+    if env_t:
+        try:
+            if "," in env_t:
+                a, b = env_t.split(",", 1)
+                timeout = (float(a.strip()), float(b.strip()))
+            else:
+                v = float(env_t)
+                timeout = (v, v)
+        except Exception:
+            timeout = DEFAULT_TIMEOUT
+
+    r = requests.get(OME_URL, params=q, headers=dict(HEADERS), timeout=timeout)
     r.raise_for_status()
     data = r.json()
 
@@ -175,13 +193,10 @@ def fetch_ome_model_forecast(station: dict, params: Optional[Dict[str, Any]] = N
     if isinstance(hourly, dict):
         times = hourly.get("time")
         if isinstance(times, list) and times:
-            # Normalize time strings to "...Z" so timestamptz cast is unambiguous.
             tz_times: List[str] = []
             for t in times:
                 tz = _ensure_time_z(t)
                 if tz is None:
-                    # Skip invalid timestamps; maintain alignment by dropping corresponding indices is messy,
-                    # so if we hit invalid, just omit hourly entirely.
                     tz_times = []
                     break
                 tz_times.append(tz)
