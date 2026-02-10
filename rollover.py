@@ -47,12 +47,12 @@ class RolloverConfig:
 
 
 DEFAULT_CONFIG = RolloverConfig(
-    retain_hourly_days=45,
-    retain_daily_days=45,
-    retain_errors_days=365,
+    retain_hourly_days=180,
+    retain_daily_days=365,
+    retain_errors_days=3650,
     retain_observations_days=3650,
-    retain_forecast_runs_days=365,
-    retain_observation_runs_days=365,
+    retain_forecast_runs_days=3650,
+    retain_observation_runs_days=3650,
     dry_run=False,
     verbose=True,
     batch_limit=50_000,
