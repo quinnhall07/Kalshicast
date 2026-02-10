@@ -35,14 +35,24 @@ DEBUG_STATION = os.getenv("DEBUG_STATION", "").strip()    # exact station_id, e.
 # Retry / throttling
 # -------------------------
 MAX_ATTEMPTS = 4
-BASE_SLEEP_SECONDS = 1.0
+BASE_SLEEP_SECONDS = 0.75
 
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name, "").strip()
+    if not v:
+        return default
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+# Provider concurrency caps (Open-Meteo lowered)
 _PROVIDER_LIMITS = {
-    "TOM": threading.Semaphore(1),
-    "WAPI": threading.Semaphore(2),
-    "VCR": threading.Semaphore(2),
-    "NWS": threading.Semaphore(4),
-    "OME": threading.Semaphore(3),
+    "TOM": threading.Semaphore(_env_int("TOM_CONCURRENCY", 1)),
+    "WAPI": threading.Semaphore(_env_int("WAPI_CONCURRENCY", 2)),
+    "VCR": threading.Semaphore(_env_int("VCR_CONCURRENCY", 2)),
+    "NWS": threading.Semaphore(_env_int("NWS_CONCURRENCY", 4)),
+    "OME": threading.Semaphore(_env_int("OME_CONCURRENCY", 2)),  # was 3
 }
 
 # -------------------------
@@ -74,6 +84,51 @@ def _provider_key(source_id: str) -> str:
         return "OME"
     return "OTHER"
 
+def _sleep_jittered_exponential(attempt: int, *, cap_s: float) -> float:
+    """
+    Exponential backoff with full jitter.
+    attempt is 1-based.
+    """
+    exp = BASE_SLEEP_SECONDS * (2 ** (attempt - 1))
+    exp = min(cap_s, exp)
+    return random.random() * exp  # full jitter in [0, exp)
+
+def _call_fetcher_with_retry(fetcher, station: dict, source_id: str) -> Any:
+    last_exc: Exception | None = None
+    sem = _PROVIDER_LIMITS.get(_provider_key(source_id))
+    prov = _provider_key(source_id)
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            print(f"[morning] fetch start {station['station_id']} {source_id} attempt={attempt}", flush=True)
+            if sem:
+                with sem:
+                    return fetcher(station)
+            return fetcher(station)
+
+        except Exception as e:
+            last_exc = e
+            if attempt >= MAX_ATTEMPTS or not _is_retryable_error(e):
+                raise
+
+            # 429: longer cap to avoid hammering; otherwise standard cap
+            msg = str(e).lower()
+            is_429 = ("429" in msg) or ("too many requests" in msg) or ("rate limit" in msg)
+
+            if is_429:
+                sleep_s = 10.0 + random.random() * 10.0  # keep simple + long
+            else:
+                # Open-Meteo: slightly higher cap to smooth bursty failures
+                cap = 12.0 if prov == "OME" else 6.0
+                sleep_s = _sleep_jittered_exponential(attempt, cap_s=cap)
+
+            print(
+                f"[morning] RETRY {station['station_id']} {source_id} attempt {attempt}/{MAX_ATTEMPTS}: {e}",
+                flush=True,
+            )
+            time.sleep(sleep_s)
+
+    raise last_exc  # pragma: no cover
 
 def _is_retryable_error(e: Exception) -> bool:
     if isinstance(e, (requests.Timeout, requests.ConnectionError)):
@@ -305,7 +360,8 @@ def main() -> None:
             print("[DEBUG] Set DEBUG_SOURCE and DEBUG_STATION to enable payload dumps.", flush=True)
 
     tasks: List[concurrent.futures.Future] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
+    max_workers = _env_int("MORNING_MAX_WORKERS", 10)  # was hardcoded 12
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
         for st in STATIONS:
             for source_id, fetcher in fetchers.items():
                 tasks.append(ex.submit(_fetch_one, st, source_id, fetcher))
@@ -386,3 +442,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
