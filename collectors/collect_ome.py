@@ -9,8 +9,8 @@ from config import HEADERS
 
 OME_URL = "https://api.open-meteo.com/v1/forecast"
 
-# 3-day horizon (instead of 2): today + next 2 days = 3 target dates
-HORIZON_DAYS = 3
+# 4-day horizon: today + next 3 days = 4 target dates
+HORIZON_DAYS = 4
 
 _DAILY_VARS = [
     "temperature_2m_max",
@@ -28,8 +28,10 @@ _HOURLY_VARS = [
 ]
 
 
-def _utc_now_z() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+def _utc_now_trunc_hour_z() -> str:
+    # Canonical issued_at for OME_BASE: fetch-time snapshot truncated to hour (UTC)
+    now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    return now.isoformat().replace("+00:00", "Z")
 
 
 def fetch_ome_forecast(station: dict, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -77,7 +79,8 @@ def fetch_ome_forecast(station: dict, params: Optional[Dict[str, Any]] = None) -
     if data.get("error"):
         raise RuntimeError(f"Open-Meteo error: {data.get('reason') or data.get('message') or data}")
 
-    issued_at = _utc_now_z()
+    # FIX: issued_at must be truncated-to-hour UTC (not "now with seconds")
+    issued_at = _utc_now_trunc_hour_z()
 
     # ---- daily list ----
     daily = data.get("daily") or {}
