@@ -29,8 +29,8 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install croniter
 
-      - name: Run rollover (no-op unless due)
+      - name: Run rollover
         env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: |
-          python rollover.py
+          WEATHER_DB_URL: ${{ secrets.WEATHER_DB_URL }}
+        run: python rollover.py
+
