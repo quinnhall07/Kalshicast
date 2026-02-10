@@ -3,7 +3,7 @@ name: Rollover (Rolling Deletion)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"  # poll-only; real schedule is inside rollover.py
+    - cron: "*/1440 * * * *"  # poll-only; real schedule is inside rollover.py
   workflow_dispatch: {}
 
 concurrency:
