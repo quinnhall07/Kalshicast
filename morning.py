@@ -1,388 +1,209 @@
-# morning.py
+# collect_ome_model.py
 from __future__ import annotations
 
-import concurrent.futures
-import json
+import math
 import os
-import random
-import threading
-import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-from config import STATIONS
-from sources_registry import load_fetchers_safe
-from etl_utils import compute_lead_hours
-from db import (
-    init_db,
-    upsert_location,
-    get_conn,
-    get_or_create_forecast_run,
-    bulk_upsert_forecasts_daily,
-    bulk_upsert_forecast_extras_hourly,
-)
+from config import HEADERS
 
-# -------------------------
-# Debug knobs (set via env)
-# -------------------------
-DEBUG_DUMP = os.getenv("DEBUG_DUMP", "0") == "1"
-DEBUG_SOURCE = os.getenv("DEBUG_SOURCE", "").strip()      # exact source_id, e.g. "OME_BASE"
-DEBUG_STATION = os.getenv("DEBUG_STATION", "").strip()    # exact station_id, e.g. "KNYC"
+OME_URL = "https://api.open-meteo.com/v1/forecast"
 
-# -------------------------
-# Retry / throttling
-# -------------------------
-MAX_ATTEMPTS = 4
-BASE_SLEEP_SECONDS = 1.0
+"""
+Collector contract REQUIRED by morning.py:
 
-_PROVIDER_LIMITS = {
-    "TOM": threading.Semaphore(1),
-    "WAPI": threading.Semaphore(2),
-    "VCR": threading.Semaphore(2),
-    "NWS": threading.Semaphore(4),
-    "OME": threading.Semaphore(3),
+{
+  "issued_at": "2026-02-01T06:00:00Z",
+  "daily": [ {"target_date":"YYYY-MM-DD","high_f":float,"low_f":float}, ... ],
+  "hourly": { "time":[...], optional variable arrays ... }  # Open-Meteo style arrays
 }
 
-# -------------------------
-# Strict payload shape
-# -------------------------
-# Collector MUST return:
-# {
-#   "issued_at": "2026-02-01T22:49:48Z",
-#   "daily": [ {"target_date":"YYYY-MM-DD","high_f":float,"low_f":float}, ... ],
-#   "hourly": { "time":[...], optional variable arrays ... }  # Open-Meteo style arrays
-# }
-#
-# Notes:
-# - "daily" is required (may be empty list).
-# - "hourly" is optional.
-# - No legacy list[dict] shape accepted.
+For Open-Meteo, there is no reliable provider-issued timestamp for a forecast “run”.
+Permanent decision: issued_at = fetch time truncated to the hour (UTC).
+"""
+
+# Lower timeouts to reduce tail latency + retry storms (morning.py handles retries).
+# Use a (connect, read) timeout tuple for better control.
+DEFAULT_TIMEOUT: Tuple[float, float] = (5.0, 15.0)
 
 
-def _provider_key(source_id: str) -> str:
-    if source_id.startswith("TOM"):
-        return "TOM"
-    if source_id.startswith("WAPI"):
-        return "WAPI"
-    if source_id.startswith("VCR"):
-        return "VCR"
-    if source_id.startswith("NWS"):
-        return "NWS"
-    if source_id.startswith("OME"):
-        return "OME"
-    return "OTHER"
+def _utc_now_trunc_hour_z() -> str:
+    now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    return now.isoformat().replace("+00:00", "Z")
 
 
-def _is_retryable_error(e: Exception) -> bool:
-    if isinstance(e, (requests.Timeout, requests.ConnectionError)):
-        return True
-    if isinstance(e, requests.HTTPError):
-        resp = getattr(e, "response", None)
-        code = getattr(resp, "status_code", None)
-        if code is None:
-            return True
-        return code == 429 or code >= 500
-
-    msg = str(e).lower()
-    return any(h in msg for h in [
-        "timed out",
-        "timeout",
-        "temporarily",
-        "try again",
-        "connection reset",
-        "service unavailable",
-        "internal server error",
-        "bad gateway",
-        "gateway timeout",
-        "too many requests",
-        "rate limit",
-    ])
-
-
-def _debug_match(station_id: str, source_id: str) -> bool:
-    return DEBUG_DUMP and (DEBUG_SOURCE == source_id) and (DEBUG_STATION == station_id)
-
-
-def _call_fetcher_with_retry(fetcher, station: dict, source_id: str) -> Any:
-    last_exc: Exception | None = None
-    sem = _PROVIDER_LIMITS.get(_provider_key(source_id))
-
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        try:
-            print(f"[morning] fetch start {station['station_id']} {source_id} attempt={attempt}", flush=True)
-            if sem:
-                with sem:
-                    return fetcher(station)
-            return fetcher(station)
-        except Exception as e:
-            last_exc = e
-            if attempt >= MAX_ATTEMPTS or not _is_retryable_error(e):
-                raise
-
-            msg = str(e).lower()
-            is_429 = ("429" in msg) or ("too many requests" in msg) or ("rate limit" in msg)
-            sleep_s = (10.0 + random.random() * 5.0) if is_429 else min(
-                5.0, (BASE_SLEEP_SECONDS * attempt) + random.random() * 0.5
-            )
-
-            print(
-                f"[morning] RETRY {station['station_id']} {source_id} attempt {attempt}/{MAX_ATTEMPTS}: {e}",
-                flush=True,
-            )
-            time.sleep(sleep_s)
-
-    raise last_exc  # pragma: no cover
-
-
-def _require_str(d: dict, k: str) -> str:
-    v = d.get(k)
-    if not isinstance(v, str) or not v.strip():
-        raise ValueError(f"payload missing/invalid '{k}' (expected non-empty str)")
-    return v.strip()
-
-
-def _coerce_float(x: Any, *, field: str) -> float:
-    if isinstance(x, (int, float)):
-        return float(x)
-    if isinstance(x, str):
-        s = x.strip()
-        if s:
-            return float(s)
-    raise ValueError(f"invalid float for {field}: {x!r}")
-
-
-def _normalize_daily(payload: dict) -> List[Dict[str, Any]]:
-    daily = payload.get("daily")
-    if not isinstance(daily, list):
-        raise ValueError("payload missing/invalid 'daily' (expected list)")
-
-    out: List[Dict[str, Any]] = []
-    for r in daily:
-        if not isinstance(r, dict):
-            continue
-        td = r.get("target_date")
-        if not isinstance(td, str) or len(td) < 10:
-            continue
-        try:
-            high_f = _coerce_float(r.get("high_f"), field="high_f")
-            low_f = _coerce_float(r.get("low_f"), field="low_f")
-        except Exception:
-            continue
-
-        out.append({"target_date": td[:10], "high_f": high_f, "low_f": low_f})
-
-    return out
-
-
-def _normalize_hourly_arrays(payload: dict) -> List[Dict[str, Any]]:
-    """
-    Hourly is stored unaggregated.
-    Supported hourly payload: Open-Meteo style arrays:
-      payload["hourly"] = { "time": [...], "<var>": [...], ... }
-
-    We map provider keys -> standardized DB column keys.
-    """
-    hourly = payload.get("hourly")
-    if hourly is None:
-        return []
-
-    if not isinstance(hourly, dict):
-        raise ValueError("payload 'hourly' must be an object when present")
-
-    times = hourly.get("time")
-    if not isinstance(times, list) or not times:
-        return []
-
-    key_map = {
-        "temperature_f": ["temperature_f", "temperature_2m"],
-        "dewpoint_f": ["dewpoint_f", "dew_point_2m"],
-        "humidity_pct": ["humidity_pct", "relative_humidity_2m"],
-        "wind_speed_mph": ["wind_speed_mph", "wind_speed_10m"],
-        "wind_dir_deg": ["wind_dir_deg", "wind_direction_10m"],
-        "cloud_cover_pct": ["cloud_cover_pct", "cloud_cover"],
-        "precip_prob_pct": ["precip_prob_pct", "precipitation_probability"],
-    }
-
-    series: Dict[str, List[Any]] = {}
-    for out_k, candidates in key_map.items():
-        for cand in candidates:
-            v = hourly.get(cand)
-            if isinstance(v, list):
-                series[out_k] = v
-                break
-
-    m = len(times)
-    for v in series.values():
-        m = min(m, len(v))
-
-    out: List[Dict[str, Any]] = []
-    for i in range(m):
-        vt = times[i]
-        if not isinstance(vt, str) or not vt.strip():
-            continue
-
-        row: Dict[str, Any] = {"valid_time": vt.strip()}
-        for k, arr in series.items():
-            val = arr[i]
-            if val is None:
-                continue
-            try:
-                row[k] = float(val)
-            except Exception:
-                continue
-
-        out.append(row)
-
-    return out
-
-
-def _normalize_payload_strict(raw: Any) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
-    if not isinstance(raw, dict):
-        raise ValueError(f"collector returned {type(raw)}; expected dict payload")
-
-    issued_at = _require_str(raw, "issued_at")
-    daily_rows = _normalize_daily(raw)
-    hourly_rows = _normalize_hourly_arrays(raw)
-
-    return issued_at, daily_rows, hourly_rows
-
-
-def _fetch_one(st: dict, source_id: str, fetcher):
-    station_id = st["station_id"]
+def _to_float(x: Any) -> Optional[float]:
     try:
-        raw = _call_fetcher_with_retry(fetcher, st, source_id)
-
-        if _debug_match(station_id, source_id):
-            print("[DEBUG raw type]", type(raw), flush=True)
-            if isinstance(raw, dict):
-                print("[DEBUG raw keys]", list(raw.keys()), flush=True)
-                d = raw.get("daily")
-                if isinstance(d, list) and d:
-                    print("[DEBUG raw first daily row]", json.dumps(d[0], default=str)[:2000], flush=True)
-                h = raw.get("hourly")
-                if isinstance(h, dict):
-                    print("[DEBUG raw hourly keys]", list(h.keys())[:50], flush=True)
-
-        issued_at, daily_rows, hourly_rows = _normalize_payload_strict(raw)
-
-        if _debug_match(station_id, source_id):
-            if daily_rows:
-                print("[DEBUG normalized daily first row]", json.dumps(daily_rows[0], default=str)[:2000], flush=True)
-            if hourly_rows:
-                print("[DEBUG normalized hourly first row]", json.dumps(hourly_rows[0], default=str)[:2000], flush=True)
-
-        return (station_id, st, source_id, issued_at, daily_rows, hourly_rows, None)
-
-    except Exception as e:
-        return (station_id, st, source_id, None, [], [], e)
+        if x is None:
+            return None
+        v = float(x)
+        if math.isfinite(v):
+            return v
+        return None
+    except Exception:
+        return None
 
 
-def main() -> None:
-    init_db()
+def _ensure_time_z(ts: Any) -> Optional[str]:
+    """
+    Open-Meteo hourly time is typically "YYYY-MM-DDTHH:MM" in UTC (no tz).
+    Convert to "YYYY-MM-DDTHH:MM:00Z" so Postgres ::timestamptz is unambiguous.
+    """
+    if not isinstance(ts, str) or not ts.strip():
+        return None
+    s = ts.strip()
+    try:
+        if s.endswith("Z"):
+            dt = datetime.fromisoformat(s[:-1] + "+00:00")
+        else:
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone.utc).replace(second=0, microsecond=0)
+        return dt.isoformat().replace("+00:00", "Z")
+    except Exception:
+        if len(s) >= 16 and s[10] == "T":
+            return s[:16] + ":00Z"
+        return None
 
-    print(
-        "[DEBUG env]",
-        "DEBUG_DUMP=", os.getenv("DEBUG_DUMP"),
-        "DEBUG_SOURCE=", os.getenv("DEBUG_SOURCE"),
-        "DEBUG_STATION=", os.getenv("DEBUG_STATION"),
-        flush=True,
-    )
 
-    for st in STATIONS:
-        upsert_location(st)
+def fetch_ome_model_forecast(station: dict, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Open-Meteo multi-model collector (non-base models).
 
-    fetchers = load_fetchers_safe()
-    if not fetchers:
-        print("[morning] ERROR: no enabled sources loaded (check config.SOURCES).", flush=True)
-        return
+    Expects params to include model selection, e.g.:
+      {"model": "gfs_seamless"} or {"models": "icon_seamless"} depending on Open-Meteo API.
 
-    if DEBUG_DUMP:
-        print("[DEBUG available sources]", sorted(fetchers.keys()), flush=True)
-        print("[DEBUG available stations]", [s["station_id"] for s in STATIONS], flush=True)
-        if not DEBUG_SOURCE or not DEBUG_STATION:
-            print("[DEBUG] Set DEBUG_SOURCE and DEBUG_STATION to enable payload dumps.", flush=True)
+    Also supports:
+      - days_ahead: int (default 3; clamped 1..7) meaning today..today+days_ahead inclusive
+        NOTE: your overall project wants a 4-day horizon for WAPI, but Open-Meteo models can remain as configured
+        via params / config. (morning.py does not enforce horizon.)
 
-    tasks: List[concurrent.futures.Future] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
-        for st in STATIONS:
-            for source_id, fetcher in fetchers.items():
-                tasks.append(ex.submit(_fetch_one, st, source_id, fetcher))
+    Returns:
+      - daily highs/lows in F: high_f/low_f
+      - hourly arrays object (Open-Meteo native arrays), with time normalized to "...Z"
+    """
+    lat = station.get("lat")
+    lon = station.get("lon")
+    if lat is None or lon is None:
+        raise ValueError("Open-Meteo fetch requires station['lat'] and station['lon'].")
 
-        with get_conn() as conn:
-            for fut in concurrent.futures.as_completed(tasks):
-                station_id, st, source_id, issued_at, daily_rows, hourly_rows, err = fut.result()
+    p: Dict[str, Any] = dict(params or {})
 
-                if err is not None:
-                    print(f"[morning] FAIL {station_id} {source_id}: {err}", flush=True)
+    days_ahead = 3
+    if p.get("days_ahead") is not None:
+        try:
+            days_ahead = int(p.pop("days_ahead"))
+        except Exception:
+            pass
+    days_ahead = max(1, min(7, days_ahead))
+
+    start = date.today()
+    end = start + timedelta(days=days_ahead)
+
+    q: Dict[str, Any] = {
+        "latitude": float(lat),
+        "longitude": float(lon),
+        "timezone": "UTC",
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "temperature_unit": "fahrenheit",
+        "wind_speed_unit": "mph",
+        "daily": "temperature_2m_max,temperature_2m_min",
+        "hourly": ",".join(
+            [
+                "temperature_2m",
+                "dew_point_2m",
+                "relative_humidity_2m",
+                "wind_speed_10m",
+                "wind_direction_10m",
+                "cloud_cover",
+                "precipitation_probability",
+            ]
+        ),
+    }
+    q.update(p)
+
+    # Allow overriding timeout via env if needed (e.g., in CI).
+    # Format: "connect,read" or single float for both.
+    timeout = DEFAULT_TIMEOUT
+    env_t = os.getenv("OME_TIMEOUT", "").strip()
+    if env_t:
+        try:
+            if "," in env_t:
+                a, b = env_t.split(",", 1)
+                timeout = (float(a.strip()), float(b.strip()))
+            else:
+                v = float(env_t)
+                timeout = (v, v)
+        except Exception:
+            timeout = DEFAULT_TIMEOUT
+
+    r = requests.get(OME_URL, params=q, headers=dict(HEADERS), timeout=timeout)
+    r.raise_for_status()
+    data = r.json()
+
+    if data.get("error"):
+        raise RuntimeError(f"Open-Meteo error: {data.get('reason') or data.get('message') or data}")
+
+    issued_at = _utc_now_trunc_hour_z()
+
+    # -------- Daily --------
+    daily_rows: List[Dict[str, Any]] = []
+    daily = data.get("daily") or {}
+    d_time = daily.get("time") or []
+    d_hi = daily.get("temperature_2m_max") or []
+    d_lo = daily.get("temperature_2m_min") or []
+
+    if isinstance(d_time, list) and isinstance(d_hi, list) and isinstance(d_lo, list):
+        n = min(len(d_time), len(d_hi), len(d_lo))
+        for i in range(n):
+            td = str(d_time[i])[:10]
+            hi = _to_float(d_hi[i])
+            lo = _to_float(d_lo[i])
+            if hi is None or lo is None:
+                continue
+            daily_rows.append({"target_date": td, "high_f": float(hi), "low_f": float(lo)})
+
+    # If daily missing, derive from hourly temperature_2m
+    if not daily_rows:
+        hourly = data.get("hourly") or {}
+        h_time = hourly.get("time") or []
+        h_temp = hourly.get("temperature_2m") or []
+        if isinstance(h_time, list) and isinstance(h_temp, list) and h_time and h_temp:
+            by_day: Dict[str, List[float]] = {}
+            for t, v in zip(h_time, h_temp):
+                td = str(t)[:10]
+                fv = _to_float(v)
+                if fv is None:
                     continue
-
-                if not daily_rows and not hourly_rows:
-                    print(f"[morning] WARN {station_id} {source_id}: no rows", flush=True)
+                by_day.setdefault(td, []).append(float(fv))
+            for td, vals in sorted(by_day.items()):
+                if not vals:
                     continue
+                daily_rows.append({"target_date": td, "high_f": max(vals), "low_f": min(vals)})
 
-                run_id = get_or_create_forecast_run(source=source_id, issued_at=issued_at, conn=conn)
+    # -------- Hourly (arrays object) --------
+    out: Dict[str, Any] = {"issued_at": issued_at, "daily": daily_rows}
 
-                # ---- DAILY ----
-                if daily_rows:
-                    daily_batch: List[Dict[str, Any]] = []
-                    for r in daily_rows:
-                        td = r["target_date"]
+    hourly = data.get("hourly")
+    if isinstance(hourly, dict):
+        times = hourly.get("time")
+        if isinstance(times, list) and times:
+            tz_times: List[str] = []
+            for t in times:
+                tz = _ensure_time_z(t)
+                if tz is None:
+                    tz_times = []
+                    break
+                tz_times.append(tz)
 
-                        lead_high = compute_lead_hours(
-                            station_tz=st["timezone"],
-                            issued_at=issued_at,
-                            target_date=td,
-                            kind="high",
-                        )
-                        lead_low = compute_lead_hours(
-                            station_tz=st["timezone"],
-                            issued_at=issued_at,
-                            target_date=td,
-                            kind="low",
-                        )
+            if tz_times:
+                hourly_norm: Dict[str, Any] = dict(hourly)
+                hourly_norm["time"] = tz_times
+                out["hourly"] = hourly_norm
 
-                        daily_batch.append({
-                            "run_id": run_id,
-                            "station_id": station_id,
-                            "target_date": td,
-                            "high_f": r["high_f"],
-                            "low_f": r["low_f"],
-                            "lead_high_hours": lead_high,
-                            "lead_low_hours": lead_low,
-                        })
-
-                    wrote = bulk_upsert_forecasts_daily(conn, daily_batch)
-                    conn.commit()
-                    print(f"[morning] OK {station_id} {source_id}: wrote {wrote} daily rows issued_at={issued_at}", flush=True)
-
-                # ---- HOURLY ----
-                if hourly_rows:
-                    hourly_batch: List[Dict[str, Any]] = []
-                    for hr in hourly_rows:
-                        vt = hr.get("valid_time")
-                        if not isinstance(vt, str) or not vt.strip():
-                            continue
-
-                        hourly_batch.append({
-                            "run_id": run_id,
-                            "station_id": station_id,
-                            "valid_time": vt.strip(),
-                            "temperature_f": hr.get("temperature_f"),
-                            "dewpoint_f": hr.get("dewpoint_f"),
-                            "humidity_pct": hr.get("humidity_pct"),
-                            "wind_speed_mph": hr.get("wind_speed_mph"),
-                            "wind_dir_deg": hr.get("wind_dir_deg"),
-                            "cloud_cover_pct": hr.get("cloud_cover_pct"),
-                            "precip_prob_pct": hr.get("precip_prob_pct"),
-                        })
-
-                    if hourly_batch:
-                        wrote = bulk_upsert_forecast_extras_hourly(conn, hourly_batch)
-                        conn.commit()
-                        print(f"[morning] OK {station_id} {source_id}: wrote {wrote} hourly rows issued_at={issued_at}", flush=True)
-
-
-if __name__ == "__main__":
-    main()
+    return out
