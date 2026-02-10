@@ -1,0 +1,37 @@
+# .github/workflows/rollover.yml
+name: Rollover (Rolling Deletion)
+
+on:
+  schedule:
+    # Daily at 07:25 UTC
+    - cron: "25 7 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: rollover
+  cancel-in-progress: false
+
+jobs:
+  rollover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run rollover
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python rollover.py --config rollover_config.json
