@@ -120,16 +120,16 @@ def get_or_create_forecast_run(*, source: str, issued_at: str, fetched_at: Optio
 # Daily forecasts (condensed)
 # -------------------------
 
-def bulk_upsert_forecasts_daily(conn, rows: List[dict]) -> int:
+def bulk_upsert_forecasts_daily(conn, rows: list[dict]) -> int:
     """
-    Requires: public.forecasts_daily
-      (run_id uuid, station_id text, target_date date,
-       high_f real, low_f real,
-       lead_hours_high real, lead_hours_low real,
-       primary key (run_id, station_id, target_date))
+    Upsert into forecasts_daily.
 
-    rows items:
-      run_id, station_id, target_date, high_f, low_f, lead_hours_high, lead_hours_low
+    Schema columns:
+      lead_hours_high, lead_hours_low
+
+    Backward-compatible input keys accepted:
+      lead_hours_high OR lead_high_hours
+      lead_hours_low  OR lead_low_hours
     """
     if not rows:
         return 0
@@ -139,21 +139,37 @@ def bulk_upsert_forecasts_daily(conn, rows: List[dict]) -> int:
       run_id, station_id, target_date,
       high_f, low_f,
       lead_hours_high, lead_hours_low
-    ) values (
-      %(run_id)s, %(station_id)s, %(target_date)s::date,
-      %(high_f)s, %(low_f)s,
-      %(lead_hours_high)s, %(lead_hours_low)s
     )
-    on conflict (run_id, station_id, target_date)
-    do update set
+    values (%s,%s,%s,%s,%s,%s,%s)
+    on conflict (run_id, station_id, target_date) do update set
       high_f = excluded.high_f,
       low_f  = excluded.low_f,
       lead_hours_high = excluded.lead_hours_high,
-      lead_hours_low  = excluded.lead_hours_low;
+      lead_hours_low  = excluded.lead_hours_low
+    ;
     """
+
+    prepared = []
+    for r in rows:
+        # Accept either naming convention from upstream
+        lead_hi = r.get("lead_hours_high", r.get("lead_high_hours"))
+        lead_lo = r.get("lead_hours_low", r.get("lead_low_hours"))
+
+        prepared.append((
+            r["run_id"],
+            r["station_id"],
+            r["target_date"],
+            r.get("high_f"),
+            r.get("low_f"),
+            lead_hi,
+            lead_lo,
+        ))
+
     with conn.cursor() as cur:
-        cur.executemany(sql, rows)
-    return len(rows)
+        cur.executemany(sql, prepared)
+
+    conn.commit()
+    return len(prepared)
 
 
 # -------------------------
@@ -552,5 +568,6 @@ def update_dashboard_stats(*, window_days: int, station_id: Optional[str] = None
                 )
 
         conn.commit()
+
 
 
