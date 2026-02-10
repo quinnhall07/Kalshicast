@@ -7,7 +7,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
-
+import os
+import yaml
 from db import get_conn
 
 """
@@ -156,6 +157,16 @@ def _delete_batched(
 
 
 def main() -> None:
+    # rollover.py (inside main(), before first DB call)
+    ops_path = Path("ops_config.yml")
+    if ops_path.exists():
+        ops = yaml.safe_load(ops_path.read_text(encoding="utf-8")) or {}
+        env_var = ((ops.get("database") or {}).get("env_var") or "").strip()
+        if env_var:
+            # If DATABASE_URL is set but WEATHER_DB_URL is what db.py expects, copy it over.
+            if os.getenv(env_var) is None and os.getenv("DATABASE_URL"):
+                os.environ[env_var] = os.getenv("DATABASE_URL")
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="rollover_config.json", help="Path to rollover JSON config")
     args = ap.parse_args()
