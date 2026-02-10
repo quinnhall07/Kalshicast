@@ -1,0 +1,11 @@
+# ops_config.yml
+database:
+  # The environment variable name db.py expects (WEATHER_DB_URL is what your db.py error mentions)
+  env_var: WEATHER_DB_URL
+
+  # GitHub secret name that stores the DB URL (edit this if your repo secret is named differently)
+  github_secret: DATABASE_URL
+
+rollover:
+  cron: "25 7 * * *"   # daily at 07:25 UTC
+  config_path: "rollover_config.json"  # if you want, you can change to a yml later
