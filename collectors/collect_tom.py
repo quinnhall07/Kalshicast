@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 from datetime import date, datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -11,25 +11,81 @@ from config import HEADERS
 
 TOM_URL = "https://api.tomorrow.io/v4/timelines"
 
+"""
+STRICT payload shape required by sources_registry + morning.py:
 
-def _utc_now_z() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+{
+  "issued_at": "...Z",
+  "daily": [
+    {"target_date": "YYYY-MM-DD", "high_f": float, "low_f": float},
+    ...
+  ],
+  "hourly": {                     # optional
+    "time": ["YYYY-MM-DDTHH:MM:00Z", ...],
+    "temperature_f": [float|None, ...],
+    "dewpoint_f": [float|None, ...],          # may be unavailable
+    "humidity_pct": [float|None, ...],
+    "wind_speed_mph": [float|None, ...],
+    "wind_dir_deg": [float|None, ...],
+    "cloud_cover_pct": [float|None, ...],
+    "precip_prob_pct": [float|None, ...],
+  }
+}
+
+Notes:
+- Tomorrow.io does not provide a stable "model run" timestamp here; we use fetch time truncated to hour UTC.
+- We request 1d and (optionally) 1h timesteps in a single call.
+"""
+
+
+def _utc_now_trunc_hour_z() -> str:
+    now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    return now.isoformat().replace("+00:00", "Z")
+
+
+def _to_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def _ensure_time_z(s: Any) -> Optional[str]:
+    """
+    Tomorrow.io returns ISO timestamps with 'Z' already.
+    Normalize to minute precision with ':00Z' seconds if needed.
+    """
+    if not isinstance(s, str) or not s.strip():
+        return None
+    t = s.strip()
+    try:
+        if t.endswith("Z"):
+            dt = datetime.fromisoformat(t[:-1] + "+00:00")
+        else:
+            dt = datetime.fromisoformat(t)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone.utc).replace(second=0, microsecond=0)
+        return dt.isoformat().replace("+00:00", "Z")
+    except Exception:
+        # Fallback: just return yyyy-mm-ddThh:mm:00Z when possible
+        if len(t) >= 16 and "T" in t:
+            return t[:16] + ":00Z"
+        return None
 
 
 def fetch_tom_forecast(station: dict, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """
-    Strict payload shape:
-      {
-        "issued_at": "...Z",
-        "rows": [
-          {"target_date": "YYYY-MM-DD", "high": float, "low": float, "extras": {...}},
-          ...
-        ]
-      }
+    Tomorrow.io collector -> STRICT payload.
 
-    Notes:
-      - Default horizon: 3 days (today + next 2 days)
-      - Extras are daily aggregates from Tomorrow.io if available.
+    Params:
+      - days_ahead: int (default 3) meaning today..today+days_ahead inclusive (so 3 -> 4 days)
+      - include_hourly: bool (default True)
+
+    Units:
+      - units="imperial" => Fahrenheit, mph
     """
     params = params or {}
 
@@ -42,17 +98,29 @@ def fetch_tom_forecast(station: dict, params: Dict[str, Any] | None = None) -> D
     if not key:
         raise RuntimeError("Missing TOMORROW_API_KEY env var")
 
-    # Default to 3-day horizon (today + next 2 days)
-    ndays = int(params.get("days", 3))
-    if ndays < 1:
-        ndays = 1
+    days_ahead = 3
+    if params.get("days_ahead") is not None:
+        try:
+            days_ahead = int(params["days_ahead"])
+        except Exception:
+            pass
+    days_ahead = max(0, min(10, days_ahead))
+
+    include_hourly = True
+    if params.get("include_hourly") is not None:
+        include_hourly = bool(params["include_hourly"])
 
     today = date.today()
-    end = date.fromordinal(today.toordinal() + (ndays - 1))
+    end_day = date.fromordinal(today.toordinal() + days_ahead)
+    ndays = days_ahead + 1
     want = {date.fromordinal(today.toordinal() + i).isoformat() for i in range(ndays)}
 
-    # Daily fields (temps required; extras optional)
-    fields = [
+    # Timeline span (UTC)
+    start_time = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+    end_time = datetime.combine(end_day, datetime.max.time(), tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+
+    # Daily and hourly fields
+    daily_fields = [
         "temperatureMax",
         "temperatureMin",
         "humidityAvg",
@@ -62,14 +130,28 @@ def fetch_tom_forecast(station: dict, params: Dict[str, Any] | None = None) -> D
         "precipitationProbabilityAvg",
     ]
 
-    # Tomorrow.io expects ISO timestamps; we request the span that covers desired days
-    start_time = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
-    end_time = datetime.combine(end, datetime.max.time(), tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+    hourly_fields = [
+        "temperature",
+        "humidity",
+        "windSpeed",
+        "windDirection",
+        "cloudCover",
+        "precipitationProbability",
+        # dewPoint is not always available on all plans; request anyway if present.
+        "dewPoint",
+    ]
+
+    timesteps = ["1d"]
+    fields = list(daily_fields)
+    if include_hourly:
+        timesteps.append("1h")
+        # Tomorrow.io allows one unified "fields" list; it will return what’s relevant per timestep.
+        fields.extend([f for f in hourly_fields if f not in fields])
 
     payload = {
         "location": f"{float(lat)},{float(lon)}",
         "fields": fields,
-        "timesteps": ["1d"],
+        "timesteps": timesteps,
         "units": "imperial",
         "startTime": start_time,
         "endTime": end_time,
@@ -86,66 +168,90 @@ def fetch_tom_forecast(station: dict, params: Dict[str, Any] | None = None) -> D
     r.raise_for_status()
     data = r.json()
 
-    # Normalize
+    issued_at = _utc_now_trunc_hour_z()
+
     timelines = (data.get("data") or {}).get("timelines") or []
     if not timelines:
-        return {"issued_at": _utc_now_z(), "rows": []}
+        return {"issued_at": issued_at, "daily": []}
 
-    intervals = timelines[0].get("intervals") or []
-    rows: List[Dict[str, Any]] = []
+    # Tomorrow.io returns separate timelines per timestep. Identify them.
+    t_by_step: Dict[str, dict] = {}
+    for tl in timelines:
+        step = (tl.get("timestep") or "").strip()
+        if step:
+            t_by_step[step] = tl
 
-    for it in intervals:
-        start = it.get("startTime")
-        vals = it.get("values") or {}
-        if not start or not isinstance(vals, dict):
-            continue
+    daily: List[Dict[str, Any]] = []
+    hourly_out: Dict[str, List[Any]] = {
+        "time": [],
+        "temperature_f": [],
+        "dewpoint_f": [],
+        "humidity_pct": [],
+        "wind_speed_mph": [],
+        "wind_dir_deg": [],
+        "cloud_cover_pct": [],
+        "precip_prob_pct": [],
+    }
 
-        d = str(start)[:10]
-        if d not in want:
-            continue
+    # ----- Daily -----
+    d_tl = t_by_step.get("1d") or (timelines[0] if timelines else None)
+    if isinstance(d_tl, dict):
+        intervals = d_tl.get("intervals") or []
+        if isinstance(intervals, list):
+            for it in intervals:
+                if not isinstance(it, dict):
+                    continue
+                start = it.get("startTime")
+                vals = it.get("values") or {}
+                if not isinstance(start, str) or not isinstance(vals, dict):
+                    continue
+                d = start[:10]
+                if d not in want:
+                    continue
+                hi = _to_float(vals.get("temperatureMax"))
+                lo = _to_float(vals.get("temperatureMin"))
+                if hi is None or lo is None:
+                    continue
+                daily.append({"target_date": d, "high_f": float(hi), "low_f": float(lo)})
 
-        try:
-            hi = float(vals["temperatureMax"])
-            lo = float(vals["temperatureMin"])
-        except Exception:
-            continue
+    # ----- Hourly -----
+    if include_hourly:
+        h_tl = t_by_step.get("1h")
+        if isinstance(h_tl, dict):
+            intervals = h_tl.get("intervals") or []
+            if isinstance(intervals, list):
+                for it in intervals:
+                    if not isinstance(it, dict):
+                        continue
+                    start = _ensure_time_z(it.get("startTime"))
+                    vals = it.get("values") or {}
+                    if start is None or not isinstance(vals, dict):
+                        continue
 
-        extras: Dict[str, Any] = {}
-        v = vals.get("humidityAvg")
-        if v is not None:
-            try:
-                extras["humidity_pct"] = float(v)
-            except Exception:
-                pass
+                    # Restrict to desired days (based on startTime date)
+                    d = start[:10]
+                    if d not in want:
+                        continue
 
-        v = vals.get("windSpeedAvg")
-        if v is not None:
-            try:
-                extras["wind_speed_mph"] = float(v)
-            except Exception:
-                pass
+                    hourly_out["time"].append(start)
 
-        v = vals.get("windDirectionAvg")
-        if v is not None:
-            try:
-                extras["wind_dir_deg"] = float(v)
-            except Exception:
-                pass
+                    # Tomorrow.io uses Fahrenheit already (imperial)
+                    hourly_out["temperature_f"].append(_to_float(vals.get("temperature")))
+                    hourly_out["dewpoint_f"].append(_to_float(vals.get("dewPoint")))
+                    hourly_out["humidity_pct"].append(_to_float(vals.get("humidity")))
+                    hourly_out["wind_speed_mph"].append(_to_float(vals.get("windSpeed")))
+                    hourly_out["wind_dir_deg"].append(_to_float(vals.get("windDirection")))
+                    hourly_out["cloud_cover_pct"].append(_to_float(vals.get("cloudCover")))
+                    hourly_out["precip_prob_pct"].append(_to_float(vals.get("precipitationProbability")))
 
-        v = vals.get("cloudCoverAvg")
-        if v is not None:
-            try:
-                extras["cloud_cover_pct"] = float(v)
-            except Exception:
-                pass
+    out: Dict[str, Any] = {"issued_at": issued_at, "daily": daily}
 
-        v = vals.get("precipitationProbabilityAvg")
-        if v is not None:
-            try:
-                extras["precip_prob_pct"] = float(v)
-            except Exception:
-                pass
+    if hourly_out["time"]:
+        # Truncate all arrays to min length to guarantee alignment
+        min_len = min(len(v) for v in hourly_out.values())
+        if min_len > 0:
+            for k in list(hourly_out.keys()):
+                hourly_out[k] = hourly_out[k][:min_len]
+            out["hourly"] = hourly_out
 
-        rows.append({"target_date": d, "high": hi, "low": lo, "extras": extras})
-
-    return {"issued_at": _utc_now_z(), "rows": rows}
+    return out
