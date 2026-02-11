@@ -5,7 +5,7 @@ from datetime import date, timedelta
 
 from db import init_db
 from cli_observations import fetch_observations
-from score import score_day
+from compute_metrics import score_day
 
 
 def main() -> None:
@@ -22,3 +22,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
