@@ -285,7 +285,7 @@ def _try_parse_cli_with_guardrails(
     loc_ids: List[str],
 ) -> Optional[Tuple[float, float, str, Optional[str]]]:
     """
-    Returns (high, low, raw_text, issued_at) or None
+    Returns (high, low, flagged_raw_text, issued_at) or None
     Adds a guardrail: if CLI contains a letter-suffixed value like '35R', we accept the numeric
     part but sanity-check against fallback station observations (if available).
     """
@@ -439,7 +439,7 @@ def fetch_observations_for_station(station: dict, target_date: str) -> bool:
                     obs_date=target_date,
                     observed_high=high,
                     observed_low=low,
-                    raw_text=text,
+                    flagged_flagged_raw_text=text,
                     source="NWS_CLI",
                 )
                 print(f"[obs] OK {station_id} {target_date}: high={high} low={low} (CLI)")
@@ -458,7 +458,7 @@ def fetch_observations_for_station(station: dict, target_date: str) -> bool:
                 observed_high=high,
                 observed_low=low,
                 issued_at=None,
-                raw_text=None,
+                flagged_flagged_raw_text=None,
                 source="NWS_OBS_FALLBACK",
             )
             print(f"[obs] OK {station_id} {target_date}: high={high} low={low} (fallback)")
@@ -491,4 +491,5 @@ def fetch_observations(target_date: str) -> bool:
         except Exception as e:
             print(f"[obs] FAIL {st.get('station_id')} {target_date}: {e}")
     return any_ok
+
 
