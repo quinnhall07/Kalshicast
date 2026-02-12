@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import re
 import subprocess
 from dataclasses import dataclass
@@ -8,6 +9,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, List
 
 import requests
+
+# Load .env when present (local dev / cron).
+try:
+    from dotenv import load_dotenv  # type: ignore
+
+    load_dotenv()
+except Exception:
+    pass
 
 from config import STATIONS, HEADERS
 from db import get_or_create_observation_run, upsert_observation, get_conn
@@ -40,7 +49,7 @@ class ObsPolicy:
     cli_cmd_env: str = "OBS_CLI_CMD"
 
     # METAR fallback controls
-    metar_hours_back: int = 30  # request more, then filter by UTC day
+    metar_hours_back: int = 48  # request more, then filter by UTC day
     http_timeout_s: int = 25
 
 
@@ -48,8 +57,8 @@ POLICY = ObsPolicy()
 
 
 def _split_cmd(s: str) -> List[str]:
-    # Simple env-command splitter. If you need quoting, wrap in a script and set OBS_CLI_CMD to that script.
-    return [p for p in s.strip().split() if p]
+    # Robust command splitting (supports quoting).
+    return [p for p in shlex.split(s.strip()) if p]
 
 
 def _run_cli_daily(*, station_id: str, target_date: str) -> Tuple[Optional[str], Optional[str]]:
@@ -117,6 +126,47 @@ def _parse_cli_high_low(raw: str) -> Optional[Tuple[float, float]]:
     return (hi, lo)
 
 
+_RE_TEMP_GROUP = re.compile(r"\b(M?\d{2})/(M?\d{2})\b")
+_RE_TEMP_T_GROUP = re.compile(r"\bT(\d{4})(\d{4})\b")
+
+def _c_to_f(tc: float) -> float:
+    return tc * 9.0 / 5.0 + 32.0
+
+def _parse_temp_from_raw_metar(raw: str) -> Optional[float]:
+    """Best-effort extract of air temperature from a raw METAR string."""
+    if not raw or not isinstance(raw, str):
+        return None
+
+    # Prefer T-group (tenths of °C) when present: T00221011 -> 2.2C, -1.1C
+    m = _RE_TEMP_T_GROUP.search(raw)
+    if m:
+        try:
+            t = int(m.group(1))
+            sign = -1 if t >= 5000 else 1
+            tc = sign * (t % 5000) / 10.0
+            return _c_to_f(tc)
+        except Exception:
+            pass
+
+    # Standard group 03/M02
+    m2 = _RE_TEMP_GROUP.search(raw)
+    if not m2:
+        return None
+
+    def _parse(part: str) -> Optional[float]:
+        try:
+            neg = part.startswith("M")
+            v = float(part[1:] if neg else part)
+            return -v if neg else v
+        except Exception:
+            return None
+
+    tc = _parse(m2.group(1))
+    if tc is None:
+        return None
+    return _c_to_f(tc)
+
+
 def _metar_url() -> str:
     # AviationWeather.gov API
     return "https://aviationweather.gov/api/data/metar"
@@ -130,11 +180,20 @@ def _fetch_metar_daily_utc_day(*, station_id: str, target_date: str) -> Tuple[Op
     hours = max(1, min(72, POLICY.metar_hours_back))
     q = {"ids": station_id, "format": "json", "hours": str(hours)}
 
-    r = requests.get(_metar_url(), params=q, headers=dict(HEADERS), timeout=POLICY.http_timeout_s)
+    r = requests.get(
+        _metar_url(),
+        params=q,
+        headers={**dict(HEADERS), **({} if dict(HEADERS).get("User-Agent") else {"User-Agent": "weather-forecast-project/1.0"})},
+        timeout=POLICY.http_timeout_s,
+    )
     r.raise_for_status()
     data = r.json()
 
-    rows = data.get("data") if isinstance(data, dict) else data
+    rows = (
+        data.get("data")
+        if isinstance(data, dict) and "data" in data
+        else (data.get("features") if isinstance(data, dict) and "features" in data else data)
+    )
     if not isinstance(rows, list):
         return None, None, "metar: bad response shape"
 
@@ -165,19 +224,39 @@ def _fetch_metar_daily_utc_day(*, station_id: str, target_date: str) -> Tuple[Op
         if not (day0 <= dt < day1):
             continue
 
-        tf = None
+        tf: Optional[float] = None
+
+        # 1) Explicit Fahrenheit field
         if rec.get("tempF") is not None:
             try:
                 tf = float(rec["tempF"])
             except Exception:
                 tf = None
 
+        # 2) Explicit Celsius field
         if tf is None and rec.get("tempC") is not None:
             try:
-                tc = float(rec["tempC"])
-                tf = tc * 9.0 / 5.0 + 32.0
+                tf = _c_to_f(float(rec["tempC"]))
             except Exception:
                 tf = None
+
+        # 3) Generic 'temp' field (often Celsius)
+        if tf is None and rec.get("temp") is not None:
+            try:
+                tf = _c_to_f(float(rec["temp"]))
+            except Exception:
+                tf = None
+
+        # 4) Raw METAR string parse
+        if tf is None:
+            raw = (
+                rec.get("rawOb")
+                or rec.get("rawText")
+                or rec.get("raw")
+                or rec.get("metar")
+            )
+            if isinstance(raw, str):
+                tf = _parse_temp_from_raw_metar(raw)
 
         if tf is None:
             continue
