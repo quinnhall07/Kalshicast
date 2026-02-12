@@ -260,48 +260,57 @@ def get_or_create_observation_run(*, run_issued_at: str, conn=None) -> Any:
 
 def upsert_observation(
     *,
-    run_id: Any,
+    run_id: int,
     station_id: str,
-    obs_date: str,
-    observed_high: Optional[float],
-    observed_low: Optional[float],
+    date: str,
+    observed_high: float | None,
+    observed_low: float | None,
     source: str,
-    flagged: Optional[str] = None,
+    flagged_raw_text: str | None = None,
+    raw_text: str | None = None,   # legacy alias
     conn=None,
+    **_ignored,                    # swallow stale kwargs safely
 ) -> None:
     """
-    Requires: public.observations
-      (run_id uuid, station_id text, date date,
-       observed_high double precision, observed_low double precision,
-       source text, flagged text,
-       primary key (run_id, station_id, date))
-    """
-    owns = False
-    if conn is None:
-        conn = get_conn()
-        owns = True
+    Upsert into observations.
 
-    try:
+    Backward compatible:
+      - accepts raw_text=... (legacy) and maps it to flagged_raw_text
+      - ignores unexpected kwargs to prevent pipeline breakage
+    """
+    frt = flagged_raw_text if (flagged_raw_text is not None and str(flagged_raw_text).strip()) else raw_text
+    if frt is not None and not str(frt).strip():
+        frt = None
+
+    sql = """
+    INSERT INTO observations (
+      run_id,
+      station_id,
+      date,
+      observed_high,
+      observed_low,
+      source,
+      flagged_raw_text
+    )
+    VALUES (%s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (run_id, station_id, date)
+    DO UPDATE SET
+      observed_high = EXCLUDED.observed_high,
+      observed_low  = EXCLUDED.observed_low,
+      source        = EXCLUDED.source,
+      flagged_raw_text = COALESCE(EXCLUDED.flagged_raw_text, observations.flagged_raw_text)
+    """
+
+    # Use provided conn if your db layer does that; otherwise use your existing pattern.
+    if conn is None:
+        from db import get_conn  # if get_conn exists in same module, remove this import and call directly
+        with get_conn() as c:
+            with c.cursor() as cur:
+                cur.execute(sql, (run_id, station_id, date, observed_high, observed_low, source, frt))
+            c.commit()
+    else:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                insert into public.observations
-                  (run_id, station_id, date, observed_high, observed_low, source, flagged)
-                values
-                  (%s, %s, %s::date, %s, %s, %s, %s)
-                on conflict (run_id, station_id, date) do update set
-                  observed_high = excluded.observed_high,
-                  observed_low  = excluded.observed_low,
-                  source        = excluded.source,
-                  flagged       = excluded.flagged
-                """,
-                (run_id, station_id, obs_date, observed_high, observed_low, source, flagged),
-            )
-        if owns:
-            conn.commit()
-    finally:
-        if owns:
-            conn.close()
+            cur.execute(sql, (run_id, station_id, date, observed_high, observed_low, source, frt))
 
 
 def _latest_observation_run_id(conn) -> Optional[Any]:
@@ -568,6 +577,7 @@ def update_dashboard_stats(*, window_days: int, station_id: Optional[str] = None
                 )
 
         conn.commit()
+
 
 
 
