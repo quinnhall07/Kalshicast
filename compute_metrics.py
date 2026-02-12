@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 
-from db import build_errors_for_date, update_error_stats
+from db import build_forecast_errors_for_date, update_dashboard_stats
 
 
 def _parse_windows(env_val: str | None) -> list[int]:
@@ -24,20 +24,15 @@ def _parse_windows(env_val: str | None) -> list[int]:
     return out or [2, 3, 7, 14, 30, 90]
 
 
-def compute_day(target_date: str) -> None:
-    wrote = build_errors_for_date(target_date)
+def score_day(target_date: str) -> None:
+    wrote = build_forecast_errors_for_date(target_date=target_date)
 
     if wrote == 0:
-        print(f"[compute_metrics] SKIP {target_date}: no errors written")
+        print(f"[metrics] SKIP {target_date}: no errors written")
         return
 
     windows = _parse_windows(os.getenv("STATS_WINDOWS_DAYS"))
     for w in windows:
-        update_error_stats(window_days=w)
+        update_dashboard_stats(window_days=w)
 
-    print(f"[compute_metrics] OK {target_date}: wrote {wrote} errors and updated stats windows={windows}")
-
-
-# Backwards-compatible alias if anything still calls score_day
-def score_day(target_date: str) -> None:
-    compute_day(target_date)
+    print(f"[metrics] OK {target_date}: wrote {wrote} errors and updated stats windows={windows}")
