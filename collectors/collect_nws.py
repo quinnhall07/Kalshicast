@@ -136,9 +136,9 @@ def _to_utc(dt: datetime) -> datetime:
 # -------------------------
 
 
-def _extract_points_urls(lat: float, lon: float) -> Tuple[str, str]:
+def _extract_points_urls(lat: float, lon: float) -> Tuple[str, str, str]:
     """
-    Returns (forecast_url, grid_url)
+    Returns (forecast_url, grid_url, hourly_url)
     from api.weather.gov/points/{lat},{lon}
     """
     url = f"https://api.weather.gov/points/{lat:.4f},{lon:.4f}"
@@ -148,9 +148,10 @@ def _extract_points_urls(lat: float, lon: float) -> Tuple[str, str]:
     props = (payload or {}).get("properties") or {}
     fc = props.get("forecast")
     grid = props.get("forecastGridData")
-    if not (isinstance(fc, str) and isinstance(grid, str)):
+    hourly = props.get("forecastHourly")
+    if not (isinstance(fc, str) and isinstance(grid, str) and isinstance(hourly, str)):
         raise ValueError("NWS points lookup missing forecast URLs")
-    return fc, grid
+    return fc, grid, hourly
 
 
 # -------------------------
@@ -327,7 +328,7 @@ def _extract_hourly_arrays_from_grid(payload: dict, *, days_ahead: int) -> Dict[
     ws_uom, ws_vals = _series("windSpeed")
     wd_uom, wd_vals = _series("windDirection")
     sc_uom, sc_vals = _series("skyCover")
-    pop_uom, pop_vals = _series("precipitationPotential")
+    pop_uom, pop_vals = _series("probabilityOfPrecipitation")
 
     temp_map = _expand_grid_values(temp_vals, uom=temp_uom, kind="temperature_f", start_utc=start_utc, end_utc=end_utc)
     dew_map = _expand_grid_values(dew_vals, uom=dew_uom, kind="dewpoint_f", start_utc=start_utc, end_utc=end_utc)
@@ -397,7 +398,7 @@ def fetch_nws_forecast(station: dict, params: Optional[Dict[str, Any]] = None) -
             pass
     days = max(1, min(7, days))
 
-    forecast_url, grid_url = _extract_points_urls(float(lat), float(lon))
+    forecast_url, grid_url, hourly_url = _extract_points_urls(float(lat), float(lon))
 
     r_fc = requests.get(forecast_url, headers=dict(HEADERS), timeout=25)
     r_fc.raise_for_status()
@@ -423,8 +424,103 @@ def fetch_nws_forecast(station: dict, params: Optional[Dict[str, Any]] = None) -
 
     hourly = _extract_hourly_arrays_from_grid(payload_grid, days_ahead=days)
 
+        # Build the same UTC window used by grid expansion
+    start_day = date.today()
+    end_day = start_day + timedelta(days=days)
+    start_utc = datetime.combine(start_day, datetime.min.time(), tzinfo=timezone.utc)
+    end_utc = (
+        datetime.combine(end_day, datetime.max.time(), tzinfo=timezone.utc)
+        .replace(minute=0, second=0, microsecond=0)
+    )
+
+    # Pull /forecast/hourly and merge PoP into hourly arrays
+    r_h = requests.get(hourly_url, headers=dict(HEADERS), timeout=25)
+    r_h.raise_for_status()
+    payload_h = r_h.json()
+
+    pop_hourly_map = _expand_forecast_hourly_pop(payload_h, start_utc=start_utc, end_utc=end_utc)
+    hourly = _merge_hourly_arrays(hourly, pop_map=pop_hourly_map)
+
     out: Dict[str, Any] = {"issued_at": issued_at, "daily": daily}
     if hourly and isinstance(hourly.get("time"), list) and hourly["time"]:
         out["hourly"] = hourly
     return out
+
+#-------------------
+# Helpers
+#-------------------
+
+def _expand_forecast_hourly_pop(payload: dict, *, start_utc: datetime, end_utc: datetime) -> Dict[str, float]:
+    """
+    Build hourly precip probability map from /forecast/hourly.
+    Returns: {"YYYY-MM-DDTHH:00:00Z": pop_pct}
+    """
+    props = (payload or {}).get("properties") or {}
+    periods = props.get("periods") or []
+    if not isinstance(periods, list):
+        return {}
+
+    out: Dict[str, float] = {}
+
+    for p in periods:
+        if not isinstance(p, dict):
+            continue
+
+        st = _parse_iso(p.get("startTime", ""))
+        et = _parse_iso(p.get("endTime", ""))
+
+        if not st or not et:
+            continue
+
+        st = _to_utc(st).replace(minute=0, second=0, microsecond=0)
+        et = _to_utc(et).replace(minute=0, second=0, microsecond=0)
+
+        pop_obj = p.get("probabilityOfPrecipitation") or {}
+        pop = _to_float(pop_obj.get("value") if isinstance(pop_obj, dict) else pop_obj)
+        if pop is None:
+            continue
+
+        # fill each hour from startTime up to (but not including) endTime
+        t = st
+        while t < et:
+            if start_utc <= t <= end_utc:
+                key = t.isoformat().replace("+00:00", "Z")
+                out[key] = float(pop)
+            t += timedelta(hours=1)
+
+    return out
+
+
+def _merge_hourly_arrays(
+    base: Dict[str, Any],
+    *,
+    pop_map: Dict[str, float],
+) -> Dict[str, Any]:
+    """
+    Merge precip_prob_pct into an existing hourly arrays object.
+    Fills missing values for existing timestamps; does not change time axis.
+    """
+    if not base or not isinstance(base.get("time"), list) or not base["time"]:
+        # If no base time axis, create one from pop_map
+        if not pop_map:
+            return {}
+        times = sorted(pop_map.keys())
+        return {"time": times, "precip_prob_pct": [float(pop_map[t]) for t in times]}
+
+    times: List[str] = base["time"]
+    existing = base.get("precip_prob_pct")
+    if not isinstance(existing, list) or len(existing) != len(times):
+        existing = [None] * len(times)
+
+    merged: List[Optional[float]] = []
+    for i, t in enumerate(times):
+        v = existing[i]
+        if v is None:
+            pv = pop_map.get(t)
+            merged.append(float(pv) if pv is not None else None)
+        else:
+            merged.append(float(v))
+
+    base["precip_prob_pct"] = merged
+    return base
 
