@@ -1,67 +1,83 @@
 # night.py
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta, timezone
 
-from db import init_db
 from cli_observations import fetch_observations
-import compute_metrics
+from db import (
+    init_db,
+    build_forecast_errors_for_date,
+    update_dashboard_stats,
+)
 
 
-def _run_metrics(target_date: str) -> None:
+def _parse_windows(env_val: str | None) -> list[int]:
+    # Default windows (days). Keep short + month-ish.
+    if not env_val:
+        return [2, 3, 7, 14, 30, 90]
+    out: list[int] = []
+    for part in env_val.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            n = int(part)
+            if n > 0:
+                out.append(n)
+        except ValueError:
+            continue
+    return out or [2, 3, 7, 14, 30, 90]
+
+
+def _compute_metrics_for_day(target_date: str) -> None:
     """
-    Call compute_metrics entrypoint without tightly coupling to one function name.
+    Night pipeline metrics step.
+
+    Primary path: call compute_metrics.compute_day/score_day if available.
+    Fallback path: call db.build_forecast_errors_for_date + db.update_dashboard_stats.
     """
-    for fn_name in (
-        "score_day",
-        "compute_day",
-        "compute_for_date",
-        "run_for_date",
-        "main",
-    ):
-        fn = getattr(compute_metrics, fn_name, None)
-        if callable(fn):
-            try:
-                fn(target_date)  # preferred signature
-            except TypeError:
-                fn()  # fallback if main() has no args
+    # Prefer compute_metrics if it's wired correctly.
+    try:
+        import compute_metrics  # type: ignore
+
+        if hasattr(compute_metrics, "compute_day"):
+            compute_metrics.compute_day(target_date)
             return
+        if hasattr(compute_metrics, "score_day"):
+            compute_metrics.score_day(target_date)
+            return
+    except Exception:
+        # Fall back to DB-native implementation below.
+        pass
 
-    raise RuntimeError(
-        "compute_metrics.py has no valid entrypoint "
-        "(expected score_day/compute_day/compute_for_date/run_for_date/main)."
+    wrote = build_forecast_errors_for_date(target_date=target_date)
+    if wrote == 0:
+        print(f"[night] SKIP {target_date}: no forecast errors written", flush=True)
+        return
+
+    windows = _parse_windows(os.getenv("STATS_WINDOWS_DAYS"))
+    for w in windows:
+        update_dashboard_stats(window_days=w)
+
+    print(
+        f"[night] OK {target_date}: wrote {wrote} forecast_errors and updated dashboard_stats windows={windows}",
+        flush=True,
     )
 
 
 def main() -> None:
     init_db()
 
-    # Always operate in UTC for scheduling consistency
-    target_date = (
-        datetime.now(timezone.utc).date() - timedelta(days=1)
-    ).isoformat()
+    # Use UTC consistently; "yesterday" in UTC.
+    target_date = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
 
     ok_any = fetch_observations(target_date)
-
     if not ok_any:
-        print(
-            f"[night] No observations fetched for any station for {target_date}; skipping metrics.",
-            flush=True,
-        )
+        print(f"[night] No observations fetched for any station for {target_date}; skipping metrics.", flush=True)
         return
 
-    try:
-        _run_metrics(target_date)
-        print(
-            f"[night] OK {target_date}: observations ingested; metrics computed.",
-            flush=True,
-        )
-    except Exception as e:
-        print(
-            f"[night] FAIL {target_date}: metrics computation error: {e}",
-            flush=True,
-        )
-        raise
+    _compute_metrics_for_day(target_date)
 
 
 if __name__ == "__main__":
