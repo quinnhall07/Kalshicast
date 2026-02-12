@@ -1,14 +1,25 @@
-# collect_ome_model.py
+# collectors/collect_ome_model.py
 from __future__ import annotations
 
 import math
 import os
+import random
+import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from requests.adapters import HTTPAdapter
 
-from config import HEADERS
+from config import (
+    HEADERS,
+    FORECAST_DAYS,
+    OME_TIMEOUT,
+    OME_MAX_INFLIGHT,
+    OME_MAX_ATTEMPTS,
+    OME_BACKOFF_BASE_S,
+)
 
 OME_URL = "https://api.open-meteo.com/v1/forecast"
 
@@ -21,13 +32,30 @@ Collector contract REQUIRED by morning.py:
   "hourly": { "time":[...], optional variable arrays ... }  # Open-Meteo style arrays
 }
 
-For Open-Meteo, there is no reliable provider-issued timestamp for a forecast “run”.
-Permanent decision: issued_at = fetch time truncated to the hour (UTC).
+Permanent decision for Open-Meteo: issued_at = fetch time truncated to the hour (UTC).
 """
 
-# Lower timeouts to reduce tail latency + retry storms (morning.py handles retries).
-# Use a (connect, read) timeout tuple for better control.
-DEFAULT_TIMEOUT: Tuple[float, float] = (5.0, 15.0)
+_DAILY = "temperature_2m_max,temperature_2m_min"
+_HOURLY = ",".join(
+    [
+        "temperature_2m",
+        "dew_point_2m",
+        "relative_humidity_2m",
+        "wind_speed_10m",
+        "wind_direction_10m",
+        "cloud_cover",
+        "precipitation_probability",
+    ]
+)
+
+# Shared per-process client resources
+_OME_SEM = threading.BoundedSemaphore(value=int(OME_MAX_INFLIGHT))
+_OME_SESSION = requests.Session()
+_OME_SESSION.headers.update(dict(HEADERS))
+_OME_SESSION.mount(
+    "https://",
+    HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=0),
+)
 
 
 def _utc_now_trunc_hour_z() -> str:
@@ -70,21 +98,68 @@ def _ensure_time_z(ts: Any) -> Optional[str]:
         return None
 
 
+def _parse_timeout_from_env(default: Tuple[float, float]) -> Tuple[float, float]:
+    env_t = (os.getenv("OME_TIMEOUT") or "").strip()
+    if not env_t:
+        return default
+    try:
+        if "," in env_t:
+            a, b = env_t.split(",", 1)
+            return (float(a.strip()), float(b.strip()))
+        v = float(env_t)
+        return (v, v)
+    except Exception:
+        return default
+
+
+def _is_retryable_exc(e: Exception) -> bool:
+    if isinstance(e, (requests.Timeout, requests.ConnectionError)):
+        return True
+    if isinstance(e, requests.HTTPError):
+        resp = getattr(e, "response", None)
+        code = getattr(resp, "status_code", None)
+        return code == 429 or (isinstance(code, int) and code >= 500)
+    return False
+
+
+def _get_with_retries(url: str, *, params: Dict[str, Any]) -> dict:
+    timeout = _parse_timeout_from_env(tuple(OME_TIMEOUT))
+
+    last: Optional[Exception] = None
+    for attempt in range(1, int(OME_MAX_ATTEMPTS) + 1):
+        try:
+            _OME_SEM.acquire()
+            try:
+                r = _OME_SESSION.get(url, params=params, timeout=timeout)
+            finally:
+                _OME_SEM.release()
+
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, dict) and data.get("error"):
+                raise RuntimeError(f"Open-Meteo error: {data.get('reason') or data.get('message') or data}")
+            return data
+
+        except Exception as e:
+            last = e
+            if attempt >= int(OME_MAX_ATTEMPTS) or not _is_retryable_exc(e):
+                raise
+
+            base = float(OME_BACKOFF_BASE_S) * (2 ** (attempt - 1))
+            sleep_s = base * random.uniform(0.75, 1.25)
+            time.sleep(sleep_s)
+
+    raise last  # pragma: no cover
+
+
 def fetch_ome_model_forecast(station: dict, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Open-Meteo multi-model collector (non-base models).
 
-    Expects params to include model selection, e.g.:
-      {"model": "gfs_seamless"} or {"models": "icon_seamless"} depending on Open-Meteo API.
+    params should include model selection, e.g.:
+      {"model": "gfs"} / {"model": "ecmwf"} / {"model": "icon"} / {"model": "gem"}
 
-    Also supports:
-      - days_ahead: int (default 3; clamped 1..7) meaning today..today+days_ahead inclusive
-        NOTE: your overall project wants a 4-day horizon for WAPI, but Open-Meteo models can remain as configured
-        via params / config. (morning.py does not enforce horizon.)
-
-    Returns:
-      - daily highs/lows in F: high_f/low_f
-      - hourly arrays object (Open-Meteo native arrays), with time normalized to "...Z"
+    Horizon is centralized via config.FORECAST_DAYS.
     """
     lat = station.get("lat")
     lon = station.get("lon")
@@ -93,16 +168,10 @@ def fetch_ome_model_forecast(station: dict, params: Optional[Dict[str, Any]] = N
 
     p: Dict[str, Any] = dict(params or {})
 
-    days_ahead = 3
-    if p.get("days_ahead") is not None:
-        try:
-            days_ahead = int(p.pop("days_ahead"))
-        except Exception:
-            pass
-    days_ahead = max(1, min(7, days_ahead))
-
+    days = int(FORECAST_DAYS)
+    days = max(1, min(14, days))
     start = date.today()
-    end = start + timedelta(days=days_ahead)
+    end = start + timedelta(days=days - 1)
 
     q: Dict[str, Any] = {
         "latitude": float(lat),
@@ -112,42 +181,12 @@ def fetch_ome_model_forecast(station: dict, params: Optional[Dict[str, Any]] = N
         "end_date": end.isoformat(),
         "temperature_unit": "fahrenheit",
         "wind_speed_unit": "mph",
-        "daily": "temperature_2m_max,temperature_2m_min",
-        "hourly": ",".join(
-            [
-                "temperature_2m",
-                "dew_point_2m",
-                "relative_humidity_2m",
-                "wind_speed_10m",
-                "wind_direction_10m",
-                "cloud_cover",
-                "precipitation_probability",
-            ]
-        ),
+        "daily": _DAILY,
+        "hourly": _HOURLY,
     }
     q.update(p)
 
-    # Allow overriding timeout via env if needed (e.g., in CI).
-    # Format: "connect,read" or single float for both.
-    timeout = DEFAULT_TIMEOUT
-    env_t = os.getenv("OME_TIMEOUT", "").strip()
-    if env_t:
-        try:
-            if "," in env_t:
-                a, b = env_t.split(",", 1)
-                timeout = (float(a.strip()), float(b.strip()))
-            else:
-                v = float(env_t)
-                timeout = (v, v)
-        except Exception:
-            timeout = DEFAULT_TIMEOUT
-
-    r = requests.get(OME_URL, params=q, headers=dict(HEADERS), timeout=timeout)
-    r.raise_for_status()
-    data = r.json()
-
-    if data.get("error"):
-        raise RuntimeError(f"Open-Meteo error: {data.get('reason') or data.get('message') or data}")
+    data = _get_with_retries(OME_URL, params=q)
 
     issued_at = _utc_now_trunc_hour_z()
 
@@ -170,9 +209,9 @@ def fetch_ome_model_forecast(station: dict, params: Optional[Dict[str, Any]] = N
 
     # If daily missing, derive from hourly temperature_2m
     if not daily_rows:
-        hourly = data.get("hourly") or {}
-        h_time = hourly.get("time") or []
-        h_temp = hourly.get("temperature_2m") or []
+        hourly0 = data.get("hourly") or {}
+        h_time = hourly0.get("time") or []
+        h_temp = hourly0.get("temperature_2m") or []
         if isinstance(h_time, list) and isinstance(h_temp, list) and h_time and h_temp:
             by_day: Dict[str, List[float]] = {}
             for t, v in zip(h_time, h_temp):
@@ -182,9 +221,8 @@ def fetch_ome_model_forecast(station: dict, params: Optional[Dict[str, Any]] = N
                     continue
                 by_day.setdefault(td, []).append(float(fv))
             for td, vals in sorted(by_day.items()):
-                if not vals:
-                    continue
-                daily_rows.append({"target_date": td, "high_f": max(vals), "low_f": min(vals)})
+                if vals:
+                    daily_rows.append({"target_date": td, "high_f": max(vals), "low_f": min(vals)})
 
     # -------- Hourly (arrays object) --------
     out: Dict[str, Any] = {"issued_at": issued_at, "daily": daily_rows}
