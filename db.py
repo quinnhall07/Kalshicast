@@ -260,16 +260,17 @@ def get_or_create_observation_run(*, run_issued_at: str, conn=None) -> Any:
 
 def upsert_observation(
     *,
-    run_id: int,
+    run_id: Any,
     station_id: str,
     date: str,
     observed_high: float | None,
     observed_low: float | None,
     source: str,
     flagged_raw_text: str | None = None,
-    raw_text: str | None = None,   # legacy alias
+    flagged_reason: str | None = None,
+    raw_text: str | None = None,      # legacy alias -> flagged_raw_text
     conn=None,
-    **_ignored,                    # swallow stale kwargs safely
+    **_ignored,                       # swallow stale kwargs safely
 ) -> None:
     """
     Upsert into observations.
@@ -282,35 +283,39 @@ def upsert_observation(
     if frt is not None and not str(frt).strip():
         frt = None
 
+    fre = flagged_reason
+    if fre is not None and not str(fre).strip():
+        fre = None
+
     sql = """
-    INSERT INTO observations (
+    INSERT INTO public.observations (
       run_id,
       station_id,
       date,
       observed_high,
       observed_low,
       source,
-      flagged_raw_text
+      flagged_raw_text,
+      flagged_reason
     )
-    VALUES (%s, %s, %s, %s, %s, %s, %s)
+    VALUES (%s, %s, %s::date, %s, %s, %s, %s, %s)
     ON CONFLICT (run_id, station_id, date)
     DO UPDATE SET
       observed_high = EXCLUDED.observed_high,
       observed_low  = EXCLUDED.observed_low,
       source        = EXCLUDED.source,
-      flagged_raw_text = COALESCE(EXCLUDED.flagged_raw_text, observations.flagged_raw_text)
+      flagged_raw_text = COALESCE(EXCLUDED.flagged_raw_text, public.observations.flagged_raw_text),
+      flagged_reason   = COALESCE(EXCLUDED.flagged_reason,   public.observations.flagged_reason)
     """
 
-    # Use provided conn if your db layer does that; otherwise use your existing pattern.
     if conn is None:
-        from db import get_conn  # if get_conn exists in same module, remove this import and call directly
         with get_conn() as c:
             with c.cursor() as cur:
-                cur.execute(sql, (run_id, station_id, date, observed_high, observed_low, source, frt))
+                cur.execute(sql, (run_id, station_id, date, observed_high, observed_low, source, frt, fre))
             c.commit()
     else:
         with conn.cursor() as cur:
-            cur.execute(sql, (run_id, station_id, date, observed_high, observed_low, source, frt))
+            cur.execute(sql, (run_id, station_id, date, observed_high, observed_low, source, frt, fre))
 
 
 def _latest_observation_run_id(conn) -> Optional[Any]:
@@ -577,6 +582,7 @@ def update_dashboard_stats(*, window_days: int, station_id: Optional[str] = None
                 )
 
         conn.commit()
+
 
 
 
