@@ -1,4 +1,3 @@
-# night.py
 from __future__ import annotations
 
 from datetime import date, timedelta
@@ -12,6 +11,7 @@ def main() -> None:
     init_db()
 
     target_date = (date.today() - timedelta(days=1)).isoformat()
+
     ok_any = fetch_observations(target_date)
 
     if ok_any:
