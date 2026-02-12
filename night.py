@@ -2,6 +2,14 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
+# Ensure .env is loaded when running locally/cron.
+try:
+    from dotenv import load_dotenv  # type: ignore
+
+    load_dotenv()
+except Exception:
+    pass
+
 from db import init_db
 from cli_observations import fetch_observations
 from compute_metrics import score_day
