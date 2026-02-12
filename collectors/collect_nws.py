@@ -1,4 +1,4 @@
-# collect_nws.py
+# collectors/collect_nws.py
 from __future__ import annotations
 
 import math
@@ -327,7 +327,7 @@ def _extract_hourly_arrays_from_grid(payload: dict, *, days_ahead: int) -> Dict[
     ws_uom, ws_vals = _series("windSpeed")
     wd_uom, wd_vals = _series("windDirection")
     sc_uom, sc_vals = _series("skyCover")
-    pop_uom, pop_vals = _series("probabilityOfPrecipitation")
+    pop_uom, pop_vals = _series("precipitationPotential")
 
     temp_map = _expand_grid_values(temp_vals, uom=temp_uom, kind="temperature_f", start_utc=start_utc, end_utc=end_utc)
     dew_map = _expand_grid_values(dew_vals, uom=dew_uom, kind="dewpoint_f", start_utc=start_utc, end_utc=end_utc)
@@ -427,3 +427,4 @@ def fetch_nws_forecast(station: dict, params: Optional[Dict[str, Any]] = None) -
     if hourly and isinstance(hourly.get("time"), list) and hourly["time"]:
         out["hourly"] = hourly
     return out
+
