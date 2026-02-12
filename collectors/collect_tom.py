@@ -1,13 +1,13 @@
-# collect_tom.py
+# collectors/collect_tom.py
 from __future__ import annotations
 
 import os
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
 import requests
 
-from config import HEADERS
+from config import HEADERS, FORECAST_DAYS
 
 TOM_URL = "https://api.tomorrow.io/v4/timelines"
 
@@ -32,9 +32,9 @@ STRICT payload shape required by sources_registry + morning.py:
   }
 }
 
-Notes:
-- Tomorrow.io does not provide a stable "model run" timestamp here; we use fetch time truncated to hour UTC.
-- We request 1d and (optionally) 1h timesteps in a single call.
+Horizon policy:
+- Uses config.FORECAST_DAYS (today..today+FORECAST_DAYS-1 inclusive).
+- Source params no longer control days; only include_hourly remains optional.
 """
 
 
@@ -70,7 +70,6 @@ def _ensure_time_z(s: Any) -> Optional[str]:
         dt = dt.astimezone(timezone.utc).replace(second=0, microsecond=0)
         return dt.isoformat().replace("+00:00", "Z")
     except Exception:
-        # Fallback: just return yyyy-mm-ddThh:mm:00Z when possible
         if len(t) >= 16 and "T" in t:
             return t[:16] + ":00Z"
         return None
@@ -81,11 +80,13 @@ def fetch_tom_forecast(station: dict, params: Dict[str, Any] | None = None) -> D
     Tomorrow.io collector -> STRICT payload.
 
     Params:
-      - days_ahead: int (default 3) meaning today..today+days_ahead inclusive (so 3 -> 4 days)
       - include_hourly: bool (default True)
 
     Units:
       - units="imperial" => Fahrenheit, mph
+
+    Horizon:
+      - config.FORECAST_DAYS (centralized).
     """
     params = params or {}
 
@@ -98,28 +99,20 @@ def fetch_tom_forecast(station: dict, params: Dict[str, Any] | None = None) -> D
     if not key:
         raise RuntimeError("Missing TOMORROW_API_KEY env var")
 
-    days_ahead = 3
-    if params.get("days_ahead") is not None:
-        try:
-            days_ahead = int(params["days_ahead"])
-        except Exception:
-            pass
-    days_ahead = max(0, min(10, days_ahead))
-
     include_hourly = True
     if params.get("include_hourly") is not None:
         include_hourly = bool(params["include_hourly"])
 
+    # Centralized horizon
+    ndays = max(1, min(10, int(FORECAST_DAYS)))  # Tomorrow.io clamp (was 10)
     today = date.today()
-    end_day = date.fromordinal(today.toordinal() + days_ahead)
-    ndays = days_ahead + 1
-    want = {date.fromordinal(today.toordinal() + i).isoformat() for i in range(ndays)}
+    end_day = today + timedelta(days=ndays - 1)
+    want = {(today + timedelta(days=i)).isoformat() for i in range(ndays)}
 
     # Timeline span (UTC)
     start_time = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
     end_time = datetime.combine(end_day, datetime.max.time(), tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
 
-    # Daily and hourly fields
     daily_fields = [
         "temperatureMax",
         "temperatureMin",
@@ -137,7 +130,6 @@ def fetch_tom_forecast(station: dict, params: Dict[str, Any] | None = None) -> D
         "windDirection",
         "cloudCover",
         "precipitationProbability",
-        # dewPoint is not always available on all plans; request anyway if present.
         "dewPoint",
     ]
 
@@ -145,7 +137,6 @@ def fetch_tom_forecast(station: dict, params: Dict[str, Any] | None = None) -> D
     fields = list(daily_fields)
     if include_hourly:
         timesteps.append("1h")
-        # Tomorrow.io allows one unified "fields" list; it will return what’s relevant per timestep.
         fields.extend([f for f in hourly_fields if f not in fields])
 
     payload = {
@@ -174,7 +165,6 @@ def fetch_tom_forecast(station: dict, params: Dict[str, Any] | None = None) -> D
     if not timelines:
         return {"issued_at": issued_at, "daily": []}
 
-    # Tomorrow.io returns separate timelines per timestep. Identify them.
     t_by_step: Dict[str, dict] = {}
     for tl in timelines:
         step = (tl.get("timestep") or "").strip()
@@ -228,14 +218,11 @@ def fetch_tom_forecast(station: dict, params: Dict[str, Any] | None = None) -> D
                     if start is None or not isinstance(vals, dict):
                         continue
 
-                    # Restrict to desired days (based on startTime date)
                     d = start[:10]
                     if d not in want:
                         continue
 
                     hourly_out["time"].append(start)
-
-                    # Tomorrow.io uses Fahrenheit already (imperial)
                     hourly_out["temperature_f"].append(_to_float(vals.get("temperature")))
                     hourly_out["dewpoint_f"].append(_to_float(vals.get("dewPoint")))
                     hourly_out["humidity_pct"].append(_to_float(vals.get("humidity")))
@@ -247,7 +234,6 @@ def fetch_tom_forecast(station: dict, params: Dict[str, Any] | None = None) -> D
     out: Dict[str, Any] = {"issued_at": issued_at, "daily": daily}
 
     if hourly_out["time"]:
-        # Truncate all arrays to min length to guarantee alignment
         min_len = min(len(v) for v in hourly_out.values())
         if min_len > 0:
             for k in list(hourly_out.keys()):
