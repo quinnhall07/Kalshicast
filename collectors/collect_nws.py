@@ -8,7 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 
-from config import HEADERS
+from config import HEADERS, FORECAST_DAYS
 
 
 """
@@ -24,6 +24,7 @@ Notes:
 - "hourly" is optional, but if present must be arrays-object with "time".
 - Times should be UTC and parseable as timestamptz. We emit "...Z".
 - issued_at uses provider timestamp when available; otherwise fallback handled by caller/registry.
+- Horizon is centralized via config.FORECAST_DAYS.
 """
 
 
@@ -52,7 +53,6 @@ def _ensure_z_minute(ts: str) -> Optional[str]:
         return None
     s = ts.strip()
 
-    # If already has offset like +00:00 or -05:00, convert to Z via fromisoformat
     try:
         if s.endswith("Z"):
             s2 = s[:-1] + "+00:00"
@@ -67,7 +67,6 @@ def _ensure_z_minute(ts: str) -> Optional[str]:
     except Exception:
         pass
 
-    # If it's "YYYY-MM-DDTHH:MM" (no tz), assume UTC
     try:
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
@@ -159,10 +158,10 @@ def _extract_points_urls(lat: float, lon: float) -> Tuple[str, str, str]:
 # -------------------------
 
 
-def _extract_daily_high_low(payload: dict, *, days_ahead: int) -> List[Dict[str, Any]]:
+def _extract_daily_high_low(payload: dict, *, days: int) -> List[Dict[str, Any]]:
     """
     Uses /forecast endpoint periods and pairs Day/Night to get high/low per date.
-    Keeps today..today+days_ahead inclusive.
+    Keeps today..today+(days-1) inclusive.
     """
     props = (payload or {}).get("properties") or {}
     periods = props.get("periods") or []
@@ -170,7 +169,7 @@ def _extract_daily_high_low(payload: dict, *, days_ahead: int) -> List[Dict[str,
         return []
 
     start = date.today()
-    end = start + timedelta(days=days_ahead)
+    end = start + timedelta(days=days - 1)
 
     by_date: Dict[str, Dict[str, Optional[float]]] = {}
 
@@ -292,23 +291,16 @@ def _expand_grid_values(
     return out
 
 
-def _extract_hourly_arrays_from_grid(payload: dict, *, days_ahead: int) -> Dict[str, Any]:
+def _extract_hourly_arrays_from_grid(payload: dict, *, days: int) -> Dict[str, Any]:
     """
-    Build Open-Meteo style hourly arrays:
+    Build Open-Meteo style hourly arrays.
 
-      {
-        "time": [...],
-        "temperature_f": [...],
-        "dewpoint_f": [...],
-        ...
-      }
-
-    Arrays are aligned by index to "time". Missing values are None.
+    Keeps today..today+(days-1) inclusive (UTC day boundaries).
     """
     props = (payload or {}).get("properties") or {}
 
     start_day = date.today()
-    end_day = start_day + timedelta(days=days_ahead)
+    end_day = start_day + timedelta(days=days - 1)
 
     start_utc = datetime.combine(start_day, datetime.min.time(), tzinfo=timezone.utc)
     end_utc = (
@@ -353,11 +345,7 @@ def _extract_hourly_arrays_from_grid(payload: dict, *, days_ahead: int) -> Dict[
     times = sorted(keys)
 
     def _arr(m: Dict[str, float]) -> List[Optional[float]]:
-        out: List[Optional[float]] = []
-        for t in times:
-            v = m.get(t)
-            out.append(float(v) if v is not None else None)
-        return out
+        return [float(m[t]) if t in m else None for t in times]
 
     return {
         "time": times,
@@ -372,83 +360,9 @@ def _extract_hourly_arrays_from_grid(payload: dict, *, days_ahead: int) -> Dict[
 
 
 # -------------------------
-# Public fetcher
+# PoP from /forecast/hourly
 # -------------------------
 
-
-def fetch_nws_forecast(station: dict, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """
-    NWS collector:
-      - daily highs/lows from /forecast
-      - hourly features from /forecastGridData (expanded to hourly)
-
-    params:
-      - days_ahead: int (default 3; clamped 1..7)
-    """
-    lat = station.get("lat")
-    lon = station.get("lon")
-    if lat is None or lon is None:
-        raise ValueError("NWS fetch requires station['lat'] and station['lon'].")
-
-    days = 3
-    if isinstance(params, dict) and params.get("days_ahead") is not None:
-        try:
-            days = int(params["days_ahead"])
-        except Exception:
-            pass
-    days = max(1, min(7, days))
-
-    forecast_url, grid_url, hourly_url = _extract_points_urls(float(lat), float(lon))
-
-    r_fc = requests.get(forecast_url, headers=dict(HEADERS), timeout=25)
-    r_fc.raise_for_status()
-    payload_fc = r_fc.json()
-
-    props_fc = (payload_fc.get("properties") or {})
-    issued_at_raw = props_fc.get("generatedAt") or props_fc.get("updated")
-    issued_at = _ensure_z_minute(str(issued_at_raw)) if issued_at_raw else None
-    if not issued_at:
-        issued_at = _utc_now_trunc_hour_z()
-
-    daily = _extract_daily_high_low(payload_fc, days_ahead=days)
-
-    r_grid = requests.get(grid_url, headers=dict(HEADERS), timeout=25)
-    r_grid.raise_for_status()
-    payload_grid = r_grid.json()
-
-    # Prefer grid "generatedAt" if present
-    grid_gen = (payload_grid.get("properties") or {}).get("generatedAt")
-    issued2 = _ensure_z_minute(str(grid_gen)) if grid_gen else None
-    if issued2:
-        issued_at = issued2
-
-    hourly = _extract_hourly_arrays_from_grid(payload_grid, days_ahead=days)
-
-        # Build the same UTC window used by grid expansion
-    start_day = date.today()
-    end_day = start_day + timedelta(days=days)
-    start_utc = datetime.combine(start_day, datetime.min.time(), tzinfo=timezone.utc)
-    end_utc = (
-        datetime.combine(end_day, datetime.max.time(), tzinfo=timezone.utc)
-        .replace(minute=0, second=0, microsecond=0)
-    )
-
-    # Pull /forecast/hourly and merge PoP into hourly arrays
-    r_h = requests.get(hourly_url, headers=dict(HEADERS), timeout=25)
-    r_h.raise_for_status()
-    payload_h = r_h.json()
-
-    pop_hourly_map = _expand_forecast_hourly_pop(payload_h, start_utc=start_utc, end_utc=end_utc)
-    hourly = _merge_hourly_arrays(hourly, pop_map=pop_hourly_map)
-
-    out: Dict[str, Any] = {"issued_at": issued_at, "daily": daily}
-    if hourly and isinstance(hourly.get("time"), list) and hourly["time"]:
-        out["hourly"] = hourly
-    return out
-
-#-------------------
-# Helpers
-#-------------------
 
 def _expand_forecast_hourly_pop(payload: dict, *, start_utc: datetime, end_utc: datetime) -> Dict[str, float]:
     """
@@ -468,7 +382,6 @@ def _expand_forecast_hourly_pop(payload: dict, *, start_utc: datetime, end_utc: 
 
         st = _parse_iso(p.get("startTime", ""))
         et = _parse_iso(p.get("endTime", ""))
-
         if not st or not et:
             continue
 
@@ -480,7 +393,6 @@ def _expand_forecast_hourly_pop(payload: dict, *, start_utc: datetime, end_utc: 
         if pop is None:
             continue
 
-        # fill each hour from startTime up to (but not including) endTime
         t = st
         while t < et:
             if start_utc <= t <= end_utc:
@@ -491,17 +403,12 @@ def _expand_forecast_hourly_pop(payload: dict, *, start_utc: datetime, end_utc: 
     return out
 
 
-def _merge_hourly_arrays(
-    base: Dict[str, Any],
-    *,
-    pop_map: Dict[str, float],
-) -> Dict[str, Any]:
+def _merge_hourly_arrays(base: Dict[str, Any], *, pop_map: Dict[str, float]) -> Dict[str, Any]:
     """
     Merge precip_prob_pct into an existing hourly arrays object.
     Fills missing values for existing timestamps; does not change time axis.
     """
     if not base or not isinstance(base.get("time"), list) or not base["time"]:
-        # If no base time axis, create one from pop_map
         if not pop_map:
             return {}
         times = sorted(pop_map.keys())
@@ -524,3 +431,70 @@ def _merge_hourly_arrays(
     base["precip_prob_pct"] = merged
     return base
 
+
+# -------------------------
+# Public fetcher
+# -------------------------
+
+
+def fetch_nws_forecast(station: dict, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    NWS collector:
+      - daily highs/lows from /forecast
+      - hourly features from /forecastGridData (expanded to hourly)
+      - hourly PoP filled from /forecast/hourly
+
+    Horizon is centralized via config.FORECAST_DAYS (clamped 1..7).
+    """
+    lat = station.get("lat")
+    lon = station.get("lon")
+    if lat is None or lon is None:
+        raise ValueError("NWS fetch requires station['lat'] and station['lon'].")
+
+    days = max(1, min(7, int(FORECAST_DAYS)))
+
+    forecast_url, grid_url, hourly_url = _extract_points_urls(float(lat), float(lon))
+
+    r_fc = requests.get(forecast_url, headers=dict(HEADERS), timeout=25)
+    r_fc.raise_for_status()
+    payload_fc = r_fc.json()
+
+    props_fc = payload_fc.get("properties") or {}
+    issued_at_raw = props_fc.get("generatedAt") or props_fc.get("updated")
+    issued_at = _ensure_z_minute(str(issued_at_raw)) if issued_at_raw else None
+    if not issued_at:
+        issued_at = _utc_now_trunc_hour_z()
+
+    daily = _extract_daily_high_low(payload_fc, days=days)
+
+    r_grid = requests.get(grid_url, headers=dict(HEADERS), timeout=25)
+    r_grid.raise_for_status()
+    payload_grid = r_grid.json()
+
+    grid_gen = (payload_grid.get("properties") or {}).get("generatedAt")
+    issued2 = _ensure_z_minute(str(grid_gen)) if grid_gen else None
+    if issued2:
+        issued_at = issued2
+
+    hourly = _extract_hourly_arrays_from_grid(payload_grid, days=days)
+
+    # Same UTC window used by grid extraction (today..today+(days-1))
+    start_day = date.today()
+    end_day = start_day + timedelta(days=days - 1)
+    start_utc = datetime.combine(start_day, datetime.min.time(), tzinfo=timezone.utc)
+    end_utc = (
+        datetime.combine(end_day, datetime.max.time(), tzinfo=timezone.utc)
+        .replace(minute=0, second=0, microsecond=0)
+    )
+
+    r_h = requests.get(hourly_url, headers=dict(HEADERS), timeout=25)
+    r_h.raise_for_status()
+    payload_h = r_h.json()
+
+    pop_hourly_map = _expand_forecast_hourly_pop(payload_h, start_utc=start_utc, end_utc=end_utc)
+    hourly = _merge_hourly_arrays(hourly, pop_map=pop_hourly_map)
+
+    out: Dict[str, Any] = {"issued_at": issued_at, "daily": daily}
+    if hourly and isinstance(hourly.get("time"), list) and hourly["time"]:
+        out["hourly"] = hourly
+    return out
