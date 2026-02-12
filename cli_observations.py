@@ -439,7 +439,6 @@ def fetch_observations_for_station(station: dict, target_date: str) -> bool:
                     obs_date=target_date,
                     observed_high=high,
                     observed_low=low,
-                    issued_at=issued_at,
                     raw_text=text,
                     source="NWS_CLI",
                 )
@@ -492,3 +491,4 @@ def fetch_observations(target_date: str) -> bool:
         except Exception as e:
             print(f"[obs] FAIL {st.get('station_id')} {target_date}: {e}")
     return any_ok
+
