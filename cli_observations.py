@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
@@ -14,6 +15,7 @@ from db import (
     get_or_create_observation_run,
     upsert_location,
     upsert_observation,
+    get_conn,
 )
 
 # -------------------------
@@ -32,6 +34,37 @@ CLI_TIMEOUT_S = int(os.getenv("OBS_CLI_TIMEOUT_S", "30"))
 NWS_METAR_URL = "https://aviationweather.gov/api/data/metar"
 HTTP_TIMEOUT_S = 25
 
+@dataclass(frozen=True)
+class CliResult:
+    ok: bool
+    raw: str
+    reason: str  # why not ok (for flagged_reason prefix)
+
+
+def _run_cli_daily(station_id: str, target_date: str) -> CliResult:
+    """
+    Run your CLI command that returns daily high/low for a station and date.
+
+    IMPORTANT:
+    - Keep this function aligned with whatever your actual CLI invocation is.
+    - This wrapper just guarantees we always return raw text for flagging.
+    """
+    # TODO: adjust this command to your real CLI tool if needed.
+    cmd = ["python", "cli_daily.py", "--station", station_id, "--date", target_date]
+
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+        raw = (p.stdout or "") + ("\n" + p.stderr if p.stderr else "")
+        raw = raw.strip()
+        if p.returncode != 0:
+            return CliResult(ok=False, raw=raw or f"CLI returncode={p.returncode}", reason=f"CLI failed (returncode={p.returncode})")
+        return CliResult(ok=True, raw=raw, reason="")
+    except subprocess.TimeoutExpired as e:
+        raw = (getattr(e, "stdout", "") or "") + ("\n" + getattr(e, "stderr", "") if getattr(e, "stderr", "") else "")
+        raw = (raw or str(e)).strip()
+        return CliResult(ok=False, raw=raw, reason="CLI failed (timeout)")
+    except Exception as e:
+        return CliResult(ok=False, raw=str(e).strip(), reason="CLI failed (exception)")
 
 def _utc_now_trunc_hour_z() -> str:
     now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
@@ -54,50 +87,36 @@ def _extract_number(line: str) -> Optional[float]:
     return _to_float(m.group(1))
 
 
-def _parse_cli_high_low(text: str) -> Tuple[Optional[float], Optional[float]]:
-    if not text:
-        return None, None
+def _parse_cli_high_low(raw: str) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+    """
+    Parse CLI output -> (high, low, parse_fail_reason)
 
-    hi: Optional[float] = None
-    lo: Optional[float] = None
+    You must match your CLI’s actual output format here.
 
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    Current behavior:
+    - returns (None,None,"no parseable cli high/low") if it can't parse.
+    """
+    if not raw or not raw.strip():
+        return None, None, "empty cli output"
 
-    hi_keys = ("MAXIMUM TEMPERATURE", "HIGH TEMPERATURE", "MAX TEMP", "HIGH TEMP", "DAILY MAX")
-    lo_keys = ("MINIMUM TEMPERATURE", "LOW TEMPERATURE", "MIN TEMP", "LOW TEMP", "DAILY MIN")
+    s = raw.strip()
 
-    for ln in lines:
-        u = ln.upper()
-        if hi is None and any(k in u for k in hi_keys):
-            v = _extract_number(ln)
-            if v is not None:
-                hi = v
-                continue
-        if lo is None and any(k in u for k in lo_keys):
-            v = _extract_number(ln)
-            if v is not None:
-                lo = v
-                continue
-
-    if hi is None:
-        for ln in lines:
-            u = ln.upper()
-            if u.startswith("MAX") or " MAX " in u:
-                v = _extract_number(ln)
-                if v is not None:
-                    hi = v
-                    break
-
-    if lo is None:
-        for ln in lines:
-            u = ln.upper()
-            if u.startswith("MIN") or " MIN " in u:
-                v = _extract_number(ln)
-                if v is not None:
-                    lo = v
-                    break
-
-    return hi, lo
+    # VERY SIMPLE parser example:
+    # Expect lines containing "high=" and "low=" somewhere.
+    try:
+        hi = None
+        lo = None
+        for token in s.replace(",", " ").replace(";", " ").split():
+            t = token.strip()
+            if t.lower().startswith("high="):
+                hi = float(t.split("=", 1)[1])
+            elif t.lower().startswith("low="):
+                lo = float(t.split("=", 1)[1])
+        if hi is None or lo is None:
+            return None, None, "no parseable cli high/low"
+        return hi, lo, None
+    except Exception:
+        return None, None, "no parseable cli high/low"
 
 
 def _run_cli_for_station_date(station_id: str, target_date: str) -> str:
@@ -155,73 +174,76 @@ def _metar_daily_high_low(station_id: str, target_date: str) -> Tuple[Optional[f
 
 
 def fetch_observations(target_date: str) -> bool:
-    for st in STATIONS:
-        upsert_location(st)
+    """
+    For each station:
+      - authoritative source is CLI daily high/low
+      - if CLI can't be parsed, fall back to METAR-derived daily
 
-    run_id = get_or_create_observation_run(run_issued_at=_utc_now_trunc_hour_z())
+    Writes:
+      observations.source = "CLI" or "METAR"
+      observations.flagged_raw_text = raw CLI text if CLI failed/was unparseable
+      observations.flagged_reason   = explanation if CLI failed/was unparseable
+    """
+    any_ok = False
 
-    ok_any = False
-    for st in STATIONS:
-        station_id = st["station_id"]
+    with get_conn() as conn:
+        run_id = get_or_create_observation_run(run_issued_at=f"{target_date}T00:00:00Z", conn=conn)
 
-        cli_text = ""
-        cli_hi = cli_lo = None
-        cli_err: Optional[str] = None
+        for st in STATIONS:
+            station_id = st["station_id"]
 
-        # 1) CLI attempt (authoritative)
-        # If CLI_CMD is not configured, do NOT flag; just fall back to METAR.
-        if CLI_CMD:
-            try:
-                cli_text = _run_cli_for_station_date(station_id, target_date)
-                cli_hi, cli_lo = _parse_cli_high_low(cli_text)
-                if cli_hi is None or cli_lo is None:
-                    raise ValueError("no parseable cli high/low")
-            except Exception as e:
-                cli_err = str(e)
+            cli = _run_cli_daily(station_id, target_date)
+            hi_cli, lo_cli, parse_fail = (None, None, None)
 
-        # 2) Fallback to METAR if CLI missing or failed
-        used_source = "CLI"
-        hi = cli_hi
-        lo = cli_lo
-        flagged_reason: Optional[str] = None
-        flagged_raw_text: Optional[str] = None
+            if cli.ok:
+                hi_cli, lo_cli, parse_fail = _parse_cli_high_low(cli.raw)
+            else:
+                parse_fail = cli.reason or "CLI failed"
 
-        if hi is None or lo is None:
-            try:
-                m_hi, m_lo, m_note = _metar_daily_high_low(station_id, target_date)
-                if m_hi is None or m_lo is None:
-                    raise ValueError("metar fallback produced no high/low")
-
-                used_source = "METAR"
-                hi, lo = m_hi, m_lo
-
-                # REQUIRED change:
-                # - flagged_raw_text = raw CLI output that failed parsing
-                # - flagged_reason = why it failed (+ note that METAR was used)
-                if cli_err:
-                    flagged_raw_text = (cli_text[:8000] if cli_text else None)
-                    flagged_reason = f"CLI failed ({cli_err}); used METAR fallback ({m_note})"
-            except Exception as e:
-                print(
-                    f"[obs] FAIL {station_id} {target_date}: {cli_err or ''}{' | ' if cli_err else ''}{e}",
-                    flush=True,
+            if hi_cli is not None and lo_cli is not None and parse_fail is None:
+                # CLI wins (authoritative)
+                upsert_observation(
+                    run_id=run_id,
+                    station_id=station_id,
+                    date=target_date,
+                    observed_high=hi_cli,
+                    observed_low=lo_cli,
+                    source="CLI",
+                    flagged_raw_text=None,
+                    flagged_reason=None,
+                    conn=conn,
                 )
+                conn.commit()
+                print(f"[obs] OK {station_id} {target_date}: high={hi_cli} low={lo_cli} (CLI)")
+                any_ok = True
                 continue
 
-        try:
+            # CLI failed/unparseable -> METAR fallback
+            hi_m, lo_m, metar_summary = _metar_daily_high_low(station_id, target_date)
+
+            flagged_raw_text = (cli.raw or "").strip() or None
+            # flagged_reason should explain WHY the CLI couldn't be used (+ mention fallback)
+            reason_core = parse_fail or "CLI parse failed"
+            flagged_reason = f"{reason_core}; fell back to {metar_summary}"
+
             upsert_observation(
                 run_id=run_id,
                 station_id=station_id,
                 date=target_date,
-                observed_high=float(hi),
-                observed_low=float(lo),
-                source=used_source,
+                observed_high=hi_m,
+                observed_low=lo_m,
+                source="METAR",
                 flagged_raw_text=flagged_raw_text,
                 flagged_reason=flagged_reason,
+                conn=conn,
             )
-            ok_any = True
-            print(f"[obs] OK {station_id} {target_date}: high={hi} low={lo} ({used_source})", flush=True)
-        except Exception as e:
-            print(f"[obs] FAIL {station_id} {target_date}: {e}", flush=True)
+            conn.commit()
 
-    return ok_any
+            if hi_m is None and lo_m is None:
+                print(f"[obs] FAIL {station_id} {target_date}: {reason_core} and METAR unavailable")
+            else:
+                print(f"[obs] OK {station_id} {target_date}: high={hi_m} low={lo_m} (METAR)")
+                any_ok = True
+
+    return any_ok
+
