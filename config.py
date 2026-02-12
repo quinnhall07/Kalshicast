@@ -1,6 +1,4 @@
-#config.py
-DB_PATH = "weather.db"
-
+# config.py
 HEADERS = {
     "User-Agent": "Kalshicast/1.0 (contact: quinn.hall.scho@gmail.com)"
 }
@@ -11,6 +9,16 @@ FORECAST_CYCLE_UTC_HOURS = [0, 6, 12, 18]  # start with [0, 12] if you want 2x/d
 # Lead-time anchor times (local station time)
 TARGET_LOCAL_HOUR_HIGH = 15  # ~3pm local
 TARGET_LOCAL_HOUR_LOW = 7    # ~7am local
+
+# Centralized forecast horizon (today..today+(FORECAST_DAYS-1))
+FORECAST_DAYS = 4
+
+# Open-Meteo performance knobs (applies to OME_BASE + OME_* models)
+# Env override supported in collectors via OME_TIMEOUT="connect,read" or "seconds"
+OME_TIMEOUT = (5.0, 20.0)      # (connect_s, read_s)
+OME_MAX_INFLIGHT = 4           # host-level concurrency cap
+OME_MAX_ATTEMPTS = 3           # per-request attempts (collector-internal)
+OME_BACKOFF_BASE_S = 0.6       # base backoff seconds (jittered exponential)
 
 STATIONS = [
     {
@@ -147,14 +155,16 @@ STATIONS = [
     },
     # add more...
 ]
+
 SOURCES = {
-    #National Weather Service
+    # National Weather Service
     "NWS": {
         "name": "National Weather Service",
         "enabled": True,
         "module": "collectors.collect_nws",
         "func": "fetch_nws_forecast",
     },
+
     # Open-Meteo base
     "OME_BASE": {
         "name": "Open-Meteo (default)",
@@ -164,64 +174,57 @@ SOURCES = {
         "params": {"model": "best"},
     },
 
-    # Models as separate sources
+    # Open-Meteo models as separate sources
     "OME_GFS":  {"name":"Open-Meteo GFS",   "enabled": True, "module":"collectors.collect_ome_model", "func":"fetch_ome_model_forecast", "params":{"model":"gfs"}},
     "OME_EC":   {"name":"Open-Meteo ECMWF", "enabled": True, "module":"collectors.collect_ome_model", "func":"fetch_ome_model_forecast", "params":{"model":"ecmwf"}},
     "OME_ICON": {"name":"Open-Meteo ICON",  "enabled": True, "module":"collectors.collect_ome_model", "func":"fetch_ome_model_forecast", "params":{"model":"icon"}},
     "OME_GEM":  {"name":"Open-Meteo GEM",   "enabled": True, "module":"collectors.collect_ome_model", "func":"fetch_ome_model_forecast", "params":{"model":"gem"}},
 
-    #WeatherAPI
+    # WeatherAPI
     "WAPI": {
         "name": "WeatherAPI",
-        "enabled": True,  # flip to True when your scraper is stable
+        "enabled": True,
         "module": "collectors.collect_wapi",
         "func": "fetch_wapi_forecast",
     },
-    #NOAA GFS
+
+    # NOAA GFS
     "NGFS": {
         "name": "NOAA GFS",
-        "enabled": False,  # flip to True when your scraper is stable
+        "enabled": False,
         "module": "collectors.collect_ngfs",
         "func": "fetch_ngfs_forecast",
     },
-    #NOAA HRRR
+
+    # NOAA HRRR
     "NHR3": {
         "name": "NOAA HRRR",
-        "enabled": False,  # flip to True when your scraper is stable
+        "enabled": False,
         "module": "collectors.collect_nhr3",
         "func": "fetch_nhr3_forecast",
     },
-    #Visual Crossing
+
+    # Visual Crossing
     "VCR": {
         "name": "Visual Crossing",
-        "enabled": True,  # flip to True when your scraper is stable
+        "enabled": True,
         "module": "collectors.collect_vcr",
         "func": "fetch_vcr_forecast",
         "params": {
             "unitGroup": "us",
-            "days": 4,
+            # horizon now centralized in FORECAST_DAYS; collector should read it from config
         },
     },
-    #Tomorrow.io
+
+    # Tomorrow.io
     "TOM": {
         "name": "Tomorrow.io",
         "enabled": True,
         "module": "collectors.collect_tom",
         "func": "fetch_tom_forecast",
         "params": {
-            "days": 4,        # today + tomorrow
             "units": "imperial",
+            # horizon now centralized in FORECAST_DAYS; collector should read it from config
         },
     },
-
 }
-
-
-
-
-
-
-
-
-
-
