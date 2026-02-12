@@ -1,13 +1,13 @@
-# collect_vcr.py
+# collectors/collect_vcr.py
 from __future__ import annotations
 
 import os
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
 import requests
 
-from config import HEADERS
+from config import HEADERS, FORECAST_DAYS
 
 VCR_URL = "https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline"
 
@@ -31,7 +31,12 @@ STRICT payload shape required by sources_registry + morning.py:
     "precip_prob_pct": [float|None, ...],
   }
 }
+
+Horizon policy:
+- Uses config.FORECAST_DAYS (today..today+FORECAST_DAYS-1 inclusive).
+- Source params no longer control days; only include_hourly remains optional.
 """
+
 
 def _utc_now_trunc_hour_z() -> str:
     now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
@@ -74,13 +79,13 @@ def fetch_vcr_forecast(station: dict, params: Dict[str, Any] | None = None) -> D
     Visual Crossing collector -> STRICT payload.
 
     Params:
-      - days_ahead: int (default 3) meaning today..today+days_ahead inclusive (so 3 -> 4 days)
       - include_hourly: bool (default True)
 
     Notes:
       - unitGroup=us returns Fahrenheit, mph, etc.
       - issued_at: no reliable model-run timestamp; use fetch time truncated to hour UTC.
       - hourly: uses datetimeEpoch for UTC-safe timestamps.
+      - horizon: config.FORECAST_DAYS (centralized).
     """
     params = params or {}
 
@@ -91,24 +96,18 @@ def fetch_vcr_forecast(station: dict, params: Dict[str, Any] | None = None) -> D
 
     key = _get_key()
 
-    days_ahead = 3
-    if params.get("days_ahead") is not None:
-        try:
-            days_ahead = int(params["days_ahead"])
-        except Exception:
-            pass
-    days_ahead = max(0, min(14, days_ahead))
-
     include_hourly = True
     if params.get("include_hourly") is not None:
         include_hourly = bool(params["include_hourly"])
 
+    # Centralized horizon
+    ndays = max(1, min(14, int(FORECAST_DAYS)))
     base = date.today()
-    ndays = days_ahead + 1
+    end_day = base + timedelta(days=ndays - 1)
 
     start = base.isoformat()
-    end = date.fromordinal(base.toordinal() + days_ahead).isoformat()
-    want = {date.fromordinal(base.toordinal() + i).isoformat() for i in range(ndays)}
+    end = end_day.isoformat()
+    want = {(base + timedelta(days=i)).isoformat() for i in range(ndays)}
 
     q = {
         "unitGroup": "us",
@@ -165,8 +164,10 @@ def fetch_vcr_forecast(station: dict, params: Dict[str, Any] | None = None) -> D
 
                 t = _epoch_to_time_z(h.get("datetimeEpoch"))
                 if t is None:
-                    # fallback: Visual Crossing can also provide datetime like "2026-02-10T01:00:00"
-                    # but timezone can be ambiguous; skip if epoch missing.
+                    continue
+
+                # Restrict to desired days
+                if t[:10] not in want:
                     continue
 
                 hourly_out["time"].append(t)
