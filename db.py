@@ -1,6 +1,6 @@
 # db.py (Supabase-only) — REFAC (no legacy) :contentReference[oaicite:0]{index=0}
 from __future__ import annotations
-
+import math
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -268,9 +268,9 @@ def upsert_observation(
     source: str,
     flagged_raw_text: str | None = None,
     flagged_reason: str | None = None,
-    raw_text: str | None = None,      # legacy alias -> flagged_raw_text
+    raw_text: str | None = None,  # legacy alias -> flagged_raw_text
     conn=None,
-    **_ignored,                       # swallow stale kwargs safely
+    **_ignored,  # swallow stale kwargs safely
 ) -> None:
     """
     Upsert into observations.
@@ -278,17 +278,21 @@ def upsert_observation(
     Backward compatible:
       - accepts raw_text=... (legacy) and maps it to flagged_raw_text
       - ignores unexpected kwargs to prevent pipeline breakage
+
+    Schema (authoritative):
+      observations(run_id, station_id, date, observed_high, observed_low, source, flagged_raw_text, flagged_reason)
     """
-    frt = flagged_raw_text if (flagged_raw_text is not None and str(flagged_raw_text).strip()) else raw_text
+    frt = flagged_raw_text
+    if frt is None and raw_text is not None:
+        frt = raw_text
+
     if frt is not None and not str(frt).strip():
         frt = None
-
-    fre = flagged_reason
-    if fre is not None and not str(fre).strip():
-        fre = None
+    if flagged_reason is not None and not str(flagged_reason).strip():
+        flagged_reason = None
 
     sql = """
-    INSERT INTO public.observations (
+    INSERT INTO observations (
       run_id,
       station_id,
       date,
@@ -298,24 +302,31 @@ def upsert_observation(
       flagged_raw_text,
       flagged_reason
     )
-    VALUES (%s, %s, %s::date, %s, %s, %s, %s, %s)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
     ON CONFLICT (run_id, station_id, date)
     DO UPDATE SET
-      observed_high = EXCLUDED.observed_high,
-      observed_low  = EXCLUDED.observed_low,
-      source        = EXCLUDED.source,
-      flagged_raw_text = COALESCE(EXCLUDED.flagged_raw_text, public.observations.flagged_raw_text),
-      flagged_reason   = COALESCE(EXCLUDED.flagged_reason,   public.observations.flagged_reason)
+      observed_high     = EXCLUDED.observed_high,
+      observed_low      = EXCLUDED.observed_low,
+      source            = EXCLUDED.source,
+      flagged_raw_text  = COALESCE(EXCLUDED.flagged_raw_text, observations.flagged_raw_text),
+      flagged_reason    = COALESCE(EXCLUDED.flagged_reason, observations.flagged_reason)
     """
 
     if conn is None:
+        from db import get_conn  # if get_conn is in this module, you can remove this import and call directly
         with get_conn() as c:
             with c.cursor() as cur:
-                cur.execute(sql, (run_id, station_id, date, observed_high, observed_low, source, frt, fre))
+                cur.execute(
+                    sql,
+                    (run_id, station_id, date, observed_high, observed_low, source, frt, flagged_reason),
+                )
             c.commit()
     else:
         with conn.cursor() as cur:
-            cur.execute(sql, (run_id, station_id, date, observed_high, observed_low, source, frt, fre))
+            cur.execute(
+                sql,
+                (run_id, station_id, date, observed_high, observed_low, source, frt, flagged_reason),
+            )
 
 
 def _latest_observation_run_id(conn) -> Optional[Any]:
@@ -336,122 +347,128 @@ def _latest_observation_run_id(conn) -> Optional[Any]:
 # Forecast errors (compact; keyed by run ids)
 # -------------------------
 
-def build_forecast_errors_for_date(*, target_date: str, observation_run_id: Optional[Any] = None) -> int:
+def build_forecast_errors_for_date(*, target_date: str, conn=None) -> int:
     """
-    Requires: public.forecast_errors (compact)
-      (forecast_run_id uuid, observation_run_id uuid, station_id text, target_date date, kind text,
-       forecast_f double precision, observed_f double precision,
-       error_f double precision, abs_error_f double precision,
-       lead_hours double precision,
-       primary key (forecast_run_id, observation_run_id, station_id, target_date, kind))
+    Populate forecast_errors for a single date using your schema:
 
-    Reads:
-      - public.observations (for selected observation_run_id)
-      - public.forecasts_daily + public.forecast_runs
+      forecast_errors(
+        forecast_run_id uuid,
+        observation_run_id uuid,
+        station_id text,
+        target_date date,
+        ae_high real,
+        ae_low real,
+        mae real,
+        created_at timestamptz default now()
+      )
+
+    Notes:
+    - Uses the *latest* observation per (station_id, date) by observation_runs.run_issued_at.
+    - Writes one row per (forecast_run_id, observation_run_id, station_id, target_date) when both sides exist.
     """
-    with get_conn() as conn:
-        if observation_run_id is None:
-            observation_run_id = _latest_observation_run_id(conn)
-            if observation_run_id is None:
-                return 0
+    owns = conn is None
+    if owns:
+        from db import get_conn
+        conn = get_conn()
 
+    try:
+        sql = """
+        WITH obs_latest AS (
+          SELECT DISTINCT ON (o.station_id, o.date)
+            o.station_id,
+            o.date,
+            o.run_id AS observation_run_id,
+            o.observed_high,
+            o.observed_low
+          FROM observations o
+          JOIN observation_runs r ON r.run_id = o.run_id
+          WHERE o.date = %s::date
+          ORDER BY o.station_id, o.date, r.run_issued_at DESC
+        ),
+        pairs AS (
+          SELECT
+            fr.run_id AS forecast_run_id,
+            ol.observation_run_id,
+            d.station_id,
+            d.target_date,
+            d.high_f,
+            d.low_f,
+            ol.observed_high,
+            ol.observed_low
+          FROM forecasts_daily d
+          JOIN forecast_runs fr ON fr.run_id = d.run_id
+          JOIN obs_latest ol
+            ON ol.station_id = d.station_id
+           AND ol.date = d.target_date
+          WHERE d.target_date = %s::date
+        ),
+        computed AS (
+          SELECT
+            forecast_run_id,
+            observation_run_id,
+            station_id,
+            target_date,
+            CASE
+              WHEN high_f IS NULL OR observed_high IS NULL THEN NULL
+              ELSE ABS(high_f - observed_high)
+            END AS ae_high,
+            CASE
+              WHEN low_f IS NULL OR observed_low IS NULL THEN NULL
+              ELSE ABS(low_f - observed_low)
+            END AS ae_low
+          FROM pairs
+        ),
+        computed2 AS (
+          SELECT
+            forecast_run_id,
+            observation_run_id,
+            station_id,
+            target_date,
+            ae_high,
+            ae_low,
+            CASE
+              WHEN ae_high IS NOT NULL AND ae_low IS NOT NULL THEN (ae_high + ae_low) / 2.0
+              WHEN ae_high IS NOT NULL THEN ae_high
+              WHEN ae_low  IS NOT NULL THEN ae_low
+              ELSE NULL
+            END AS mae
+          FROM computed
+        )
+        INSERT INTO forecast_errors (
+          forecast_run_id,
+          observation_run_id,
+          station_id,
+          target_date,
+          ae_high,
+          ae_low,
+          mae
+        )
+        SELECT
+          forecast_run_id,
+          observation_run_id,
+          station_id,
+          target_date,
+          ae_high,
+          ae_low,
+          mae
+        FROM computed2
+        WHERE ae_high IS NOT NULL OR ae_low IS NOT NULL
+        ON CONFLICT (forecast_run_id, observation_run_id, station_id, target_date)
+        DO UPDATE SET
+          ae_high = EXCLUDED.ae_high,
+          ae_low  = EXCLUDED.ae_low,
+          mae     = EXCLUDED.mae,
+          created_at = now()
+        """
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                select station_id, observed_high, observed_low
-                from public.observations
-                where run_id=%s and date=%s::date
-                """,
-                (observation_run_id, target_date),
-            )
-            obs_rows = cur.fetchall()
-
-            if not obs_rows:
-                return 0
-
-            wrote = 0
-
-            for station_id, oh, ol in obs_rows:
-                cur.execute(
-                    """
-                    select d.run_id, r.source, r.issued_at,
-                           d.high_f, d.low_f,
-                           d.lead_hours_high, d.lead_hours_low
-                    from public.forecasts_daily d
-                    join public.forecast_runs r on r.run_id = d.run_id
-                    where d.station_id=%s and d.target_date=%s::date
-                    """,
-                    (station_id, target_date),
-                )
-
-                for forecast_run_id, _source, _issued_at, high_f, low_f, lead_high, lead_low in cur.fetchall():
-                    # high
-                    if high_f is not None and oh is not None:
-                        err = float(high_f) - float(oh)
-                        cur.execute(
-                            """
-                            insert into public.forecast_errors
-                              (forecast_run_id, observation_run_id, station_id, target_date, kind,
-                               forecast_f, observed_f, error_f, abs_error_f, lead_hours)
-                            values
-                              (%s,%s,%s,%s::date,'high',%s,%s,%s,%s,%s)
-                            on conflict (forecast_run_id, observation_run_id, station_id, target_date, kind)
-                            do update set
-                              forecast_f = excluded.forecast_f,
-                              observed_f = excluded.observed_f,
-                              error_f = excluded.error_f,
-                              abs_error_f = excluded.abs_error_f,
-                              lead_hours = excluded.lead_hours
-                            """,
-                            (
-                                forecast_run_id,
-                                observation_run_id,
-                                station_id,
-                                target_date,
-                                float(high_f),
-                                float(oh),
-                                err,
-                                abs(err),
-                                lead_high,
-                            ),
-                        )
-                        wrote += 1
-
-                    # low
-                    if low_f is not None and ol is not None:
-                        err = float(low_f) - float(ol)
-                        cur.execute(
-                            """
-                            insert into public.forecast_errors
-                              (forecast_run_id, observation_run_id, station_id, target_date, kind,
-                               forecast_f, observed_f, error_f, abs_error_f, lead_hours)
-                            values
-                              (%s,%s,%s,%s::date,'low',%s,%s,%s,%s,%s)
-                            on conflict (forecast_run_id, observation_run_id, station_id, target_date, kind)
-                            do update set
-                              forecast_f = excluded.forecast_f,
-                              observed_f = excluded.observed_f,
-                              error_f = excluded.error_f,
-                              abs_error_f = excluded.abs_error_f,
-                              lead_hours = excluded.lead_hours
-                            """,
-                            (
-                                forecast_run_id,
-                                observation_run_id,
-                                station_id,
-                                target_date,
-                                float(low_f),
-                                float(ol),
-                                err,
-                                abs(err),
-                                lead_low,
-                            ),
-                        )
-                        wrote += 1
-
-        conn.commit()
-        return wrote
-
+            cur.execute(sql, (target_date, target_date))
+            n = cur.rowcount or 0
+        if owns:
+            conn.commit()
+        return n
+    finally:
+        if owns:
+            conn.close()
 
 # -------------------------
 # Dashboard stats (renamed from error_stats)
@@ -472,116 +489,156 @@ def _percentile(sorted_vals: List[float], p: float) -> float:
     return float(d0 + d1)
 
 
-def update_dashboard_stats(*, window_days: int, station_id: Optional[str] = None) -> None:
+def update_dashboard_stats(*, window_days: int, conn=None) -> None:
     """
-    Requires: public.dashboard_stats
-      (station_id text, source text, kind text ('high','low','both'),
-       window_days int, n int, bias double, mae double, rmse double, p10 double, p50 double, p90 double,
-       last_updated timestamptz,
-       primary key (station_id, source, kind, window_days))
+    Recompute dashboard_stats directly from forecasts_daily + latest observations.
+    This does NOT depend on forecast_errors shape beyond existence.
 
-    Reads:
-      - public.forecast_errors
-      - public.forecast_runs (for source)
+    dashboard_stats schema:
+      (station_id, source, kind, window_days, n, bias, mae, rmse, p10, p50, p90, last_updated)
+
+    kind in {'high','low','both'}.
     """
-    with get_conn() as conn:
+    if window_days <= 0:
+        window_days = 1
+
+    owns = conn is None
+    if owns:
+        from db import get_conn
+        conn = get_conn()
+
+    try:
+        sql = """
+        WITH obs_latest AS (
+          SELECT DISTINCT ON (o.station_id, o.date)
+            o.station_id,
+            o.date,
+            o.observed_high,
+            o.observed_low
+          FROM observations o
+          JOIN observation_runs r ON r.run_id = o.run_id
+          WHERE o.date >= (CURRENT_DATE - (%s::int * INTERVAL '1 day'))::date
+          ORDER BY o.station_id, o.date, r.run_issued_at DESC
+        ),
+        joined AS (
+          SELECT
+            d.station_id,
+            fr.source,
+            d.target_date AS date,
+            d.high_f,
+            d.low_f,
+            o.observed_high,
+            o.observed_low
+          FROM forecasts_daily d
+          JOIN forecast_runs fr ON fr.run_id = d.run_id
+          JOIN obs_latest o
+            ON o.station_id = d.station_id
+           AND o.date = d.target_date
+          WHERE d.target_date >= (CURRENT_DATE - (%s::int * INTERVAL '1 day'))::date
+        ),
+        high_err AS (
+          SELECT
+            station_id,
+            source,
+            (high_f - observed_high) AS err
+          FROM joined
+          WHERE high_f IS NOT NULL AND observed_high IS NOT NULL
+        ),
+        low_err AS (
+          SELECT
+            station_id,
+            source,
+            (low_f - observed_low) AS err
+          FROM joined
+          WHERE low_f IS NOT NULL AND observed_low IS NOT NULL
+        ),
+        both_err AS (
+          SELECT station_id, source, err FROM high_err
+          UNION ALL
+          SELECT station_id, source, err FROM low_err
+        ),
+        agg AS (
+          SELECT
+            station_id,
+            source,
+            'high'::text AS kind,
+            COUNT(*)::int AS n,
+            AVG(err)::float AS bias,
+            AVG(ABS(err))::float AS mae,
+            SQRT(AVG(err*err))::float AS rmse,
+            PERCENTILE_CONT(0.10) WITHIN GROUP (ORDER BY err)::float AS p10,
+            PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY err)::float AS p50,
+            PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY err)::float AS p90
+          FROM high_err
+          GROUP BY station_id, source
+
+          UNION ALL
+
+          SELECT
+            station_id,
+            source,
+            'low'::text AS kind,
+            COUNT(*)::int AS n,
+            AVG(err)::float AS bias,
+            AVG(ABS(err))::float AS mae,
+            SQRT(AVG(err*err))::float AS rmse,
+            PERCENTILE_CONT(0.10) WITHIN GROUP (ORDER BY err)::float AS p10,
+            PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY err)::float AS p50,
+            PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY err)::float AS p90
+          FROM low_err
+          GROUP BY station_id, source
+
+          UNION ALL
+
+          SELECT
+            station_id,
+            source,
+            'both'::text AS kind,
+            COUNT(*)::int AS n,
+            AVG(err)::float AS bias,
+            AVG(ABS(err))::float AS mae,
+            SQRT(AVG(err*err))::float AS rmse,
+            PERCENTILE_CONT(0.10) WITHIN GROUP (ORDER BY err)::float AS p10,
+            PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY err)::float AS p50,
+            PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY err)::float AS p90
+          FROM both_err
+          GROUP BY station_id, source
+        )
+        INSERT INTO dashboard_stats (
+          station_id, source, kind, window_days, n, bias, mae, rmse, p10, p50, p90, last_updated
+        )
+        SELECT
+          station_id,
+          source,
+          kind,
+          %s::int AS window_days,
+          n,
+          bias,
+          mae,
+          rmse,
+          p10,
+          p50,
+          p90,
+          now()
+        FROM agg
+        ON CONFLICT (station_id, source, kind, window_days)
+        DO UPDATE SET
+          n = EXCLUDED.n,
+          bias = EXCLUDED.bias,
+          mae = EXCLUDED.mae,
+          rmse = EXCLUDED.rmse,
+          p10 = EXCLUDED.p10,
+          p50 = EXCLUDED.p50,
+          p90 = EXCLUDED.p90,
+          last_updated = now()
+        """
         with conn.cursor() as cur:
-            params: List[Any] = [window_days]
-            station_clause = ""
-            if station_id:
-                station_clause = "and e.station_id=%s"
-                params.append(station_id)
-
-            cur.execute(
-                f"""
-                select
-                  e.station_id,
-                  r.source,
-                  e.kind,
-                  e.error_f,
-                  e.abs_error_f
-                from public.forecast_errors e
-                join public.forecast_runs r on r.run_id = e.forecast_run_id
-                where e.target_date >= (now()::date - (%s::int * interval '1 day'))
-                {station_clause}
-                """,
-                params,
-            )
-            rows = cur.fetchall()
-
-            by: Dict[Tuple[str, str, str], List[Tuple[float, float]]] = {}
-            for st_id, source, kind, e, ae in rows:
-                if st_id is None or source is None or kind is None:
-                    continue
-                if e is None or ae is None:
-                    continue
-                by.setdefault((str(st_id), str(source), str(kind)), []).append((float(e), float(ae)))
-
-            # per (station, source, kind)
-            for (st_id, source, kind), vals in by.items():
-                n = len(vals)
-                if n == 0:
-                    continue
-
-                errors = [v[0] for v in vals]
-                abs_errors = [v[1] for v in vals]
-
-                bias = sum(errors) / n
-                mae = sum(abs_errors) / n
-                rmse = (sum((x * x) for x in errors) / n) ** 0.5
-
-                se = sorted(errors)
-                p10 = _percentile(se, 0.10)
-                p50 = _percentile(se, 0.50)
-                p90 = _percentile(se, 0.90)
-
-                cur.execute(
-                    """
-                    insert into public.dashboard_stats
-                      (station_id, source, kind, window_days, n, bias, mae, rmse, p10, p50, p90, last_updated)
-                    values
-                      (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
-                    on conflict (station_id, source, kind, window_days) do update set
-                      n=excluded.n,
-                      bias=excluded.bias,
-                      mae=excluded.mae,
-                      rmse=excluded.rmse,
-                      p10=excluded.p10,
-                      p50=excluded.p50,
-                      p90=excluded.p90,
-                      last_updated=now()
-                    """,
-                    (st_id, source, kind, window_days, n, bias, mae, rmse, p10, p50, p90),
-                )
-
-            # 'both' rollup
-            stations_sources = sorted({(k[0], k[1]) for k in by.keys()})
-            for st_id, source in stations_sources:
-                highs = by.get((st_id, source, "high"), [])
-                lows = by.get((st_id, source, "low"), [])
-                if not highs or not lows:
-                    continue
-
-                mae_high = sum(v[1] for v in highs) / len(highs)
-                mae_low = sum(v[1] for v in lows) / len(lows)
-                mae_both = (mae_high + mae_low) / 2.0
-                n = min(len(highs), len(lows))
-
-                cur.execute(
-                    """
-                    insert into public.dashboard_stats
-                      (station_id, source, kind, window_days, n, mae, last_updated)
-                    values
-                      (%s,%s,'both',%s,%s,%s, now())
-                    on conflict (station_id, source, kind, window_days) do update set
-                      n=excluded.n,
-                      mae=excluded.mae,
-                      last_updated=now()
-                    """,
-                    (st_id, source, window_days, n, mae_both),
-                )
-
-        conn.commit()
+            cur.execute(sql, (window_days, window_days, window_days))
+        if owns:
+            conn.commit()
+    finally:
+        if owns:
+            conn.close()
 
 
 
