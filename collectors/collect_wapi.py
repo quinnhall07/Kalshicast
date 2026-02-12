@@ -1,4 +1,4 @@
-# collect_wapi.py
+# collectors/collect_wapi.py
 from __future__ import annotations
 
 import os
@@ -7,14 +7,9 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from config import HEADERS
+from config import HEADERS, FORECAST_DAYS
 
 WAPI_URL = "https://api.weatherapi.com/v1/forecast.json"
-
-# Fixed horizon for this source:
-# 4-day horizon => today..today+3 (4 target dates) and 96 hourly points
-HORIZON_DAYS = 4
-HORIZON_HOURS = 96
 
 """
 STRICT payload shape required by sources_registry + morning.py:
@@ -36,6 +31,10 @@ STRICT payload shape required by sources_registry + morning.py:
     "precip_prob_pct": [float|None, ...],
   }
 }
+
+Horizon policy:
+- Uses config.FORECAST_DAYS (today..today+FORECAST_DAYS-1 inclusive).
+- Hourly window is FORECAST_DAYS * 24 hours starting at 00:00 UTC today.
 """
 
 
@@ -73,8 +72,8 @@ def _to_float(x: Any) -> Optional[float]:
 def fetch_wapi_forecast(station: dict, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """
     WeatherAPI collector -> STRICT payload with normalized horizon:
-      - daily: up to 4 target dates (today..today+3)
-      - hourly: up to 96 hours starting at 00:00 UTC today
+      - daily: up to FORECAST_DAYS target dates (today..today+FORECAST_DAYS-1)
+      - hourly: up to FORECAST_DAYS * 24 hours starting at 00:00 UTC today
 
     Params:
       - include_hourly: bool (default True)
@@ -92,15 +91,15 @@ def fetch_wapi_forecast(station: dict, params: Dict[str, Any] | None = None) -> 
 
     key = _get_key()
 
-    # WeatherAPI "days" is count starting today
-    ndays = HORIZON_DAYS
+    # WeatherAPI "days" is count starting today; clamp to API limits (plan-dependent).
+    ndays = max(1, min(10, int(FORECAST_DAYS)))
+    nhours = ndays * 24
 
     base = date.today()
-    want_dates = {date.fromordinal(base.toordinal() + i).isoformat() for i in range(HORIZON_DAYS)}
+    want_dates = {date.fromordinal(base.toordinal() + i).isoformat() for i in range(ndays)}
 
-    # Hourly normalization window: [today 00:00 UTC, +96h)
     hour0 = datetime.combine(base, datetime.min.time(), tzinfo=timezone.utc)
-    hour_end = hour0 + timedelta(hours=HORIZON_HOURS)
+    hour_end = hour0 + timedelta(hours=nhours)
 
     q = {
         "key": key,
@@ -152,13 +151,12 @@ def fetch_wapi_forecast(station: dict, params: Dict[str, Any] | None = None) -> 
             if not isinstance(h, dict):
                 continue
 
-            # Use time_epoch for UTC-safe timestamps
             t = _epoch_to_time_z(h.get("time_epoch"))
             if t is None:
                 continue
 
             try:
-                dt = datetime.fromisoformat(t[:-1] + "+00:00")  # convert "Z" -> "+00:00"
+                dt = datetime.fromisoformat(t[:-1] + "+00:00")
             except Exception:
                 continue
 
@@ -174,7 +172,7 @@ def fetch_wapi_forecast(station: dict, params: Dict[str, Any] | None = None) -> 
             hourly_out["cloud_cover_pct"].append(_to_float(h.get("cloud")))
             hourly_out["precip_prob_pct"].append(_to_float(h.get("chance_of_rain")))
 
-    # Sort + de-dup hourly by time (WeatherAPI can occasionally repeat at day boundaries)
+    # Sort + de-dup hourly by time (WeatherAPI can repeat at day boundaries)
     if hourly_out["time"]:
         idx = sorted(range(len(hourly_out["time"])), key=lambda i: hourly_out["time"][i])
         for k in list(hourly_out.keys()):
@@ -191,14 +189,13 @@ def fetch_wapi_forecast(station: dict, params: Dict[str, Any] | None = None) -> 
         for k in list(hourly_out.keys()):
             hourly_out[k] = [hourly_out[k][i] for i in keep]
 
-        # Enforce max 96 points
+        # Enforce max points
         for k in list(hourly_out.keys()):
-            hourly_out[k] = hourly_out[k][:HORIZON_HOURS]
+            hourly_out[k] = hourly_out[k][:nhours]
 
     out: Dict[str, Any] = {"issued_at": issued_at, "daily": daily}
 
     if include_hourly and hourly_out["time"]:
-        # Hard align: truncate all arrays to min length
         min_len = min(len(v) for v in hourly_out.values())
         if min_len > 0:
             for k in list(hourly_out.keys()):
