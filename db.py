@@ -1,8 +1,8 @@
-# db.py (Supabase-only) — REFAC (no legacy) :contentReference[oaicite:0]{index=0}
+# db.py (Supabase-only) — REFAC (no legacy)
 from __future__ import annotations
-import math
+
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 
 # -------------------------
@@ -73,10 +73,20 @@ def upsert_location(station: dict) -> None:
 # Forecast runs
 # -------------------------
 
-def get_or_create_forecast_run(*, source: str, issued_at: str, fetched_at: Optional[str] = None, conn=None) -> Any:
+def get_or_create_forecast_run(
+    *,
+    source: str,
+    issued_at: str,
+    fetched_at: Optional[str] = None,
+    conn=None,
+) -> Any:
     """
-    Requires: public.forecast_runs(run_id uuid pk, source text, issued_at timestamptz, fetched_at timestamptz)
-    Recommended: UNIQUE (source, issued_at) for idempotency.
+    Requires:
+      public.forecast_runs(run_id uuid pk, source text, issued_at timestamptz, fetched_at timestamptz)
+
+    NOTE:
+      This uses ON CONFLICT(source, issued_at). You MUST have a UNIQUE(source, issued_at)
+      constraint/index in the DB, otherwise Postgres will error.
     """
     owns = False
     if conn is None:
@@ -117,14 +127,14 @@ def get_or_create_forecast_run(*, source: str, issued_at: str, fetched_at: Optio
 
 
 # -------------------------
-# Daily forecasts (condensed)
+# Daily forecasts
 # -------------------------
 
 def bulk_upsert_forecasts_daily(conn, rows: list[dict]) -> int:
     """
     Upsert into forecasts_daily.
 
-    Schema columns:
+    Authoritative schema columns:
       lead_hours_high, lead_hours_low
 
     Backward-compatible input keys accepted:
@@ -151,19 +161,19 @@ def bulk_upsert_forecasts_daily(conn, rows: list[dict]) -> int:
 
     prepared = []
     for r in rows:
-        # Accept either naming convention from upstream
         lead_hi = r.get("lead_hours_high", r.get("lead_high_hours"))
         lead_lo = r.get("lead_hours_low", r.get("lead_low_hours"))
-
-        prepared.append((
-            r["run_id"],
-            r["station_id"],
-            r["target_date"],
-            r.get("high_f"),
-            r.get("low_f"),
-            lead_hi,
-            lead_lo,
-        ))
+        prepared.append(
+            (
+                r["run_id"],
+                r["station_id"],
+                r["target_date"],
+                r.get("high_f"),
+                r.get("low_f"),
+                lead_hi,
+                lead_lo,
+            )
+        )
 
     with conn.cursor() as cur:
         cur.executemany(sql, prepared)
@@ -173,7 +183,7 @@ def bulk_upsert_forecasts_daily(conn, rows: list[dict]) -> int:
 
 
 # -------------------------
-# Hourly forecast extras (ML) — no extras json, no created_at
+# Hourly forecast extras
 # -------------------------
 
 def bulk_upsert_forecast_extras_hourly(conn, rows: List[dict]) -> int:
@@ -190,7 +200,7 @@ def bulk_upsert_forecast_extras_hourly(conn, rows: List[dict]) -> int:
        primary key (run_id, station_id, valid_time))
 
     rows items:
-      run_id, station_id, valid_time (ISO or datetime),
+      run_id, station_id, valid_time (ISO string),
       temperature_f, dewpoint_f, humidity_pct,
       wind_speed_mph, wind_dir_deg, cloud_cover_pct, precip_prob_pct
     """
@@ -221,11 +231,13 @@ def bulk_upsert_forecast_extras_hourly(conn, rows: List[dict]) -> int:
     """
     with conn.cursor() as cur:
         cur.executemany(sql, rows)
+
+    conn.commit()
     return len(rows)
 
 
 # -------------------------
-# Observations (new; renamed from observations_v2)
+# Observation runs / observations
 # -------------------------
 
 def get_or_create_observation_run(*, run_issued_at: str, conn=None) -> Any:
@@ -292,7 +304,7 @@ def upsert_observation(
         flagged_reason = None
 
     sql = """
-    INSERT INTO observations (
+    INSERT INTO public.observations (
       run_id,
       station_id,
       date,
@@ -302,18 +314,17 @@ def upsert_observation(
       flagged_raw_text,
       flagged_reason
     )
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+    VALUES (%s, %s, %s::date, %s, %s, %s, %s, %s)
     ON CONFLICT (run_id, station_id, date)
     DO UPDATE SET
       observed_high     = EXCLUDED.observed_high,
       observed_low      = EXCLUDED.observed_low,
       source            = EXCLUDED.source,
-      flagged_raw_text  = COALESCE(EXCLUDED.flagged_raw_text, observations.flagged_raw_text),
-      flagged_reason    = COALESCE(EXCLUDED.flagged_reason, observations.flagged_reason)
+      flagged_raw_text  = COALESCE(EXCLUDED.flagged_raw_text, public.observations.flagged_raw_text),
+      flagged_reason    = COALESCE(EXCLUDED.flagged_reason, public.observations.flagged_reason)
     """
 
     if conn is None:
-        from db import get_conn  # if get_conn is in this module, you can remove this import and call directly
         with get_conn() as c:
             with c.cursor() as cur:
                 cur.execute(
@@ -329,22 +340,8 @@ def upsert_observation(
             )
 
 
-def _latest_observation_run_id(conn) -> Optional[Any]:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            select run_id
-            from public.observation_runs
-            order by run_issued_at desc
-            limit 1
-            """
-        )
-        row = cur.fetchone()
-        return row[0] if row else None
-
-
 # -------------------------
-# Forecast errors (compact; keyed by run ids)
+# Forecast errors (keyed by run ids)
 # -------------------------
 
 def build_forecast_errors_for_date(*, target_date: str, conn=None) -> int:
@@ -368,7 +365,6 @@ def build_forecast_errors_for_date(*, target_date: str, conn=None) -> int:
     """
     owns = conn is None
     if owns:
-        from db import get_conn
         conn = get_conn()
 
     try:
@@ -380,8 +376,8 @@ def build_forecast_errors_for_date(*, target_date: str, conn=None) -> int:
             o.run_id AS observation_run_id,
             o.observed_high,
             o.observed_low
-          FROM observations o
-          JOIN observation_runs r ON r.run_id = o.run_id
+          FROM public.observations o
+          JOIN public.observation_runs r ON r.run_id = o.run_id
           WHERE o.date = %s::date
           ORDER BY o.station_id, o.date, r.run_issued_at DESC
         ),
@@ -395,8 +391,8 @@ def build_forecast_errors_for_date(*, target_date: str, conn=None) -> int:
             d.low_f,
             ol.observed_high,
             ol.observed_low
-          FROM forecasts_daily d
-          JOIN forecast_runs fr ON fr.run_id = d.run_id
+          FROM public.forecasts_daily d
+          JOIN public.forecast_runs fr ON fr.run_id = d.run_id
           JOIN obs_latest ol
             ON ol.station_id = d.station_id
            AND ol.date = d.target_date
@@ -434,7 +430,7 @@ def build_forecast_errors_for_date(*, target_date: str, conn=None) -> int:
             END AS mae
           FROM computed
         )
-        INSERT INTO forecast_errors (
+        INSERT INTO public.forecast_errors (
           forecast_run_id,
           observation_run_id,
           station_id,
@@ -470,29 +466,14 @@ def build_forecast_errors_for_date(*, target_date: str, conn=None) -> int:
         if owns:
             conn.close()
 
-# -------------------------
-# Dashboard stats (renamed from error_stats)
-# -------------------------
 
-def _percentile(sorted_vals: List[float], p: float) -> float:
-    if not sorted_vals:
-        return float("nan")
-    if len(sorted_vals) == 1:
-        return float(sorted_vals[0])
-    k = (len(sorted_vals) - 1) * p
-    f = int(k)
-    c = min(f + 1, len(sorted_vals) - 1)
-    if f == c:
-        return float(sorted_vals[f])
-    d0 = sorted_vals[f] * (c - k)
-    d1 = sorted_vals[c] * (k - f)
-    return float(d0 + d1)
-
+# -------------------------
+# Dashboard stats
+# -------------------------
 
 def update_dashboard_stats(*, window_days: int, conn=None) -> None:
     """
     Recompute dashboard_stats directly from forecasts_daily + latest observations.
-    This does NOT depend on forecast_errors shape beyond existence.
 
     dashboard_stats schema:
       (station_id, source, kind, window_days, n, bias, mae, rmse, p10, p50, p90, last_updated)
@@ -504,7 +485,6 @@ def update_dashboard_stats(*, window_days: int, conn=None) -> None:
 
     owns = conn is None
     if owns:
-        from db import get_conn
         conn = get_conn()
 
     try:
@@ -515,8 +495,8 @@ def update_dashboard_stats(*, window_days: int, conn=None) -> None:
             o.date,
             o.observed_high,
             o.observed_low
-          FROM observations o
-          JOIN observation_runs r ON r.run_id = o.run_id
+          FROM public.observations o
+          JOIN public.observation_runs r ON r.run_id = o.run_id
           WHERE o.date >= (CURRENT_DATE - (%s::int * INTERVAL '1 day'))::date
           ORDER BY o.station_id, o.date, r.run_issued_at DESC
         ),
@@ -529,8 +509,8 @@ def update_dashboard_stats(*, window_days: int, conn=None) -> None:
             d.low_f,
             o.observed_high,
             o.observed_low
-          FROM forecasts_daily d
-          JOIN forecast_runs fr ON fr.run_id = d.run_id
+          FROM public.forecasts_daily d
+          JOIN public.forecast_runs fr ON fr.run_id = d.run_id
           JOIN obs_latest o
             ON o.station_id = d.station_id
            AND o.date = d.target_date
@@ -604,7 +584,7 @@ def update_dashboard_stats(*, window_days: int, conn=None) -> None:
           FROM both_err
           GROUP BY station_id, source
         )
-        INSERT INTO dashboard_stats (
+        INSERT INTO public.dashboard_stats (
           station_id, source, kind, window_days, n, bias, mae, rmse, p10, p50, p90, last_updated
         )
         SELECT
@@ -639,8 +619,3 @@ def update_dashboard_stats(*, window_days: int, conn=None) -> None:
     finally:
         if owns:
             conn.close()
-
-
-
-
-
