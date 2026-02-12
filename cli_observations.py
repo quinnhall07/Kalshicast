@@ -21,8 +21,6 @@ from db import (
 # -------------------------
 
 CLI_CMD = os.getenv("OBS_CLI_CMD", "").strip()
-# If you already have a working CLI command, set OBS_CLI_CMD in GitHub Actions, e.g.:
-#   OBS_CLI_CMD="python -m your_cli_module"
 # If blank, we won't attempt CLI and will go straight to METAR fallback.
 
 CLI_TIMEOUT_S = int(os.getenv("OBS_CLI_TIMEOUT_S", "30"))
@@ -50,7 +48,6 @@ def _to_float(x: object) -> Optional[float]:
 
 
 def _extract_number(line: str) -> Optional[float]:
-    # grabs first number like -12, 12, 12.3
     m = re.search(r"(-?\d+(?:\.\d+)?)", line)
     if not m:
         return None
@@ -58,10 +55,6 @@ def _extract_number(line: str) -> Optional[float]:
 
 
 def _parse_cli_high_low(text: str) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Try hard to parse CLI-style daily summary text.
-    Handles common NWS daily climate report formats.
-    """
     if not text:
         return None, None
 
@@ -70,7 +63,6 @@ def _parse_cli_high_low(text: str) -> Tuple[Optional[float], Optional[float]]:
 
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
 
-    # Pass 1: targeted keywords on same line
     hi_keys = ("MAXIMUM TEMPERATURE", "HIGH TEMPERATURE", "MAX TEMP", "HIGH TEMP", "DAILY MAX")
     lo_keys = ("MINIMUM TEMPERATURE", "LOW TEMPERATURE", "MIN TEMP", "LOW TEMP", "DAILY MIN")
 
@@ -87,7 +79,6 @@ def _parse_cli_high_low(text: str) -> Tuple[Optional[float], Optional[float]]:
                 lo = v
                 continue
 
-    # Pass 2: table-ish formats where "MAX" and "MIN" might be separate tokens
     if hi is None:
         for ln in lines:
             u = ln.upper()
@@ -110,15 +101,9 @@ def _parse_cli_high_low(text: str) -> Tuple[Optional[float], Optional[float]]:
 
 
 def _run_cli_for_station_date(station_id: str, target_date: str) -> str:
-    """
-    Calls your authoritative CLI. You must provide OBS_CLI_CMD in env.
-    Must return raw stdout text.
-    """
     if not CLI_CMD:
         return ""
 
-    # We allow a generic CLI that accepts station/date flags; adjust if your CLI differs.
-    # If your CLI uses different flags, update these two args in ONE place.
     cmd = CLI_CMD.split() + ["--station", station_id, "--date", target_date]
 
     p = subprocess.run(
@@ -134,12 +119,6 @@ def _run_cli_for_station_date(station_id: str, target_date: str) -> str:
 
 
 def _metar_daily_high_low(station_id: str, target_date: str) -> Tuple[Optional[float], Optional[float], str]:
-    """
-    Non-authoritative fallback:
-    Pull METARs and compute max/min temp for the UTC day.
-    Returns (hi, lo, raw_text_summary)
-    """
-    # target_date is YYYY-MM-DD
     start = f"{target_date}T00:00:00Z"
     end_dt = datetime.fromisoformat(target_date).replace(tzinfo=timezone.utc) + timedelta(days=1)
     end = end_dt.isoformat().replace("+00:00", "Z")
@@ -156,12 +135,9 @@ def _metar_daily_high_low(station_id: str, target_date: str) -> Tuple[Optional[f
     data = r.json()
 
     temps = []
-    # aviationweather.gov returns list of dict records (varies); try common fields
     for rec in data if isinstance(data, list) else []:
-        # temperature can appear as 'temp' (C) or 'temp_f' depending on endpoint version; try both
         tf = rec.get("temp_f")
         if tf is None and rec.get("temp") is not None:
-            # assume C -> F
             try:
                 tf = float(rec["temp"]) * 9.0 / 5.0 + 32.0
             except Exception:
@@ -179,14 +155,6 @@ def _metar_daily_high_low(station_id: str, target_date: str) -> Tuple[Optional[f
 
 
 def fetch_observations(target_date: str) -> bool:
-    """
-    Writes observations for all stations for target_date.
-    Authoritative source: CLI parsed highs/lows.
-    Fallback: METAR-derived highs/lows if CLI unparseable.
-
-    Returns True if at least one station was successfully written.
-    """
-    # Ensure locations exist
     for st in STATIONS:
         upsert_location(st)
 
@@ -201,19 +169,22 @@ def fetch_observations(target_date: str) -> bool:
         cli_err: Optional[str] = None
 
         # 1) CLI attempt (authoritative)
-        try:
-            cli_text = _run_cli_for_station_date(station_id, target_date)
-            cli_hi, cli_lo = _parse_cli_high_low(cli_text)
-            if cli_hi is None or cli_lo is None:
-                raise ValueError("no parseable cli high/low")
-        except Exception as e:
-            cli_err = str(e)
+        # If CLI_CMD is not configured, do NOT flag; just fall back to METAR.
+        if CLI_CMD:
+            try:
+                cli_text = _run_cli_for_station_date(station_id, target_date)
+                cli_hi, cli_lo = _parse_cli_high_low(cli_text)
+                if cli_hi is None or cli_lo is None:
+                    raise ValueError("no parseable cli high/low")
+            except Exception as e:
+                cli_err = str(e)
 
-        # 2) Fallback to METAR if CLI failed
+        # 2) Fallback to METAR if CLI missing or failed
         used_source = "CLI"
         hi = cli_hi
         lo = cli_lo
-        flagged = None
+        flagged_reason: Optional[str] = None
+        flagged_raw_text: Optional[str] = None
 
         if hi is None or lo is None:
             try:
@@ -223,9 +194,18 @@ def fetch_observations(target_date: str) -> bool:
 
                 used_source = "METAR"
                 hi, lo = m_hi, m_lo
-                flagged = f"CLI failed ({cli_err}); {m_note}"
+
+                # REQUIRED change:
+                # - flagged_raw_text = raw CLI output that failed parsing
+                # - flagged_reason = why it failed (+ note that METAR was used)
+                if cli_err:
+                    flagged_raw_text = (cli_text[:8000] if cli_text else None)
+                    flagged_reason = f"CLI failed ({cli_err}); used METAR fallback ({m_note})"
             except Exception as e:
-                print(f"[obs] FAIL {station_id} {target_date}: {cli_err or ''}{' | ' if cli_err else ''}{e}", flush=True)
+                print(
+                    f"[obs] FAIL {station_id} {target_date}: {cli_err or ''}{' | ' if cli_err else ''}{e}",
+                    flush=True,
+                )
                 continue
 
         try:
@@ -236,8 +216,8 @@ def fetch_observations(target_date: str) -> bool:
                 observed_high=float(hi),
                 observed_low=float(lo),
                 source=used_source,
-                flagged_raw_text=flagged,
-                raw_text=(cli_text[:8000] if cli_text else None),
+                flagged_raw_text=flagged_raw_text,
+                flagged_reason=flagged_reason,
             )
             ok_any = True
             print(f"[obs] OK {station_id} {target_date}: high={hi} low={lo} ({used_source})", flush=True)
