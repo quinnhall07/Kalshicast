@@ -1,16 +1,26 @@
 # collectors/collect_ome.py  (OME_BASE)
 from __future__ import annotations
 
-import requests
+import os
+import random
+import threading
+import time
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from config import HEADERS
+import requests
+from requests.adapters import HTTPAdapter
+
+from config import (
+    HEADERS,
+    FORECAST_DAYS,
+    OME_TIMEOUT,
+    OME_MAX_INFLIGHT,
+    OME_MAX_ATTEMPTS,
+    OME_BACKOFF_BASE_S,
+)
 
 OME_URL = "https://api.open-meteo.com/v1/forecast"
-
-# 4-day horizon: today + next 3 days = 4 target dates
-HORIZON_DAYS = 4
 
 _DAILY_VARS = [
     "temperature_2m_max",
@@ -27,11 +37,75 @@ _HOURLY_VARS = [
     "precipitation_probability",
 ]
 
+# Shared per-process client resources
+_OME_SEM = threading.BoundedSemaphore(value=int(OME_MAX_INFLIGHT))
+_OME_SESSION = requests.Session()
+_OME_SESSION.headers.update(dict(HEADERS))
+_OME_SESSION.mount(
+    "https://",
+    HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=0),
+)
+
 
 def _utc_now_trunc_hour_z() -> str:
-    # Canonical issued_at for OME_BASE: fetch-time snapshot truncated to hour (UTC)
     now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     return now.isoformat().replace("+00:00", "Z")
+
+
+def _parse_timeout_from_env(default: Tuple[float, float]) -> Tuple[float, float]:
+    env_t = (os.getenv("OME_TIMEOUT") or "").strip()
+    if not env_t:
+        return default
+    try:
+        if "," in env_t:
+            a, b = env_t.split(",", 1)
+            return (float(a.strip()), float(b.strip()))
+        v = float(env_t)
+        return (v, v)
+    except Exception:
+        return default
+
+
+def _is_retryable_exc(e: Exception) -> bool:
+    if isinstance(e, (requests.Timeout, requests.ConnectionError)):
+        return True
+    if isinstance(e, requests.HTTPError):
+        resp = getattr(e, "response", None)
+        code = getattr(resp, "status_code", None)
+        return code == 429 or (isinstance(code, int) and code >= 500)
+    return False
+
+
+def _get_with_retries(url: str, *, params: Dict[str, Any]) -> dict:
+    timeout = _parse_timeout_from_env(tuple(OME_TIMEOUT))
+
+    last: Optional[Exception] = None
+
+    for attempt in range(1, int(OME_MAX_ATTEMPTS) + 1):
+        try:
+            _OME_SEM.acquire()
+            try:
+                r = _OME_SESSION.get(url, params=params, timeout=timeout)
+            finally:
+                _OME_SEM.release()
+
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, dict) and data.get("error"):
+                raise RuntimeError(f"Open-Meteo error: {data.get('reason') or data.get('message') or data}")
+            return data
+
+        except Exception as e:
+            last = e
+            if attempt >= int(OME_MAX_ATTEMPTS) or not _is_retryable_exc(e):
+                raise
+
+            # jittered exponential backoff
+            base = float(OME_BACKOFF_BASE_S) * (2 ** (attempt - 1))
+            sleep_s = base * random.uniform(0.75, 1.25)
+            time.sleep(sleep_s)
+
+    raise last  # pragma: no cover
 
 
 def fetch_ome_forecast(station: dict, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -48,8 +122,10 @@ def fetch_ome_forecast(station: dict, params: Optional[Dict[str, Any]] = None) -
     if lat is None or lon is None:
         raise ValueError("Open-Meteo fetch requires station['lat'] and station['lon'].")
 
+    days = int(FORECAST_DAYS)
+    days = max(1, min(14, days))  # safety clamp
     today = date.today()
-    end_date = today + timedelta(days=HORIZON_DAYS - 1)  # inclusive
+    end_date = today + timedelta(days=days - 1)  # inclusive
 
     q: Dict[str, Any] = {
         "latitude": float(lat),
@@ -72,14 +148,8 @@ def fetch_ome_forecast(station: dict, params: Optional[Dict[str, Any]] = None) -
     if params:
         q.update(params)
 
-    r = requests.get(OME_URL, params=q, headers=dict(HEADERS), timeout=25)
-    r.raise_for_status()
-    data = r.json()
+    data = _get_with_retries(OME_URL, params=q)
 
-    if data.get("error"):
-        raise RuntimeError(f"Open-Meteo error: {data.get('reason') or data.get('message') or data}")
-
-    # FIX: issued_at must be truncated-to-hour UTC (not "now with seconds")
     issued_at = _utc_now_trunc_hour_z()
 
     # ---- daily list ----
