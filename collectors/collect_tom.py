@@ -2,12 +2,19 @@
 from __future__ import annotations
 
 import os
-from datetime import date, datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
 import requests
 
 from config import HEADERS, FORECAST_DAYS
+from collectors.time_axis import (
+    axis_start_end,
+    build_hourly_axis_z,
+    daily_targets_from_axis,
+    hourly_axis_set,
+    truncate_issued_at_to_hour_z,
+)
 
 TOM_URL = "https://api.tomorrow.io/v4/timelines"
 
@@ -20,10 +27,10 @@ STRICT payload shape required by sources_registry + morning.py:
     {"target_date": "YYYY-MM-DD", "high_f": float, "low_f": float},
     ...
   ],
-  "hourly": {                     # optional
-    "time": ["YYYY-MM-DDTHH:MM:00Z", ...],
+  "hourly": {
+    "time": ["YYYY-MM-DDTHH:00:00Z", ...],      # ALWAYS axis length (FORECAST_DAYS*24)
     "temperature_f": [float|None, ...],
-    "dewpoint_f": [float|None, ...],          # may be unavailable
+    "dewpoint_f": [float|None, ...],
     "humidity_pct": [float|None, ...],
     "wind_speed_mph": [float|None, ...],
     "wind_dir_deg": [float|None, ...],
@@ -32,15 +39,10 @@ STRICT payload shape required by sources_registry + morning.py:
   }
 }
 
-Horizon policy:
-- Uses config.FORECAST_DAYS (today..today+FORECAST_DAYS-1 inclusive).
-- Source params no longer control days; only include_hourly remains optional.
+Uses collectors.time_axis to enforce a shared forward-looking UTC axis.
+Tomorrow.io typically supports 1h/1d timelines; we request a window covering the axis.
+If Tomorrow returns fewer points (rare), we keep axis and fill missing with None.
 """
-
-
-def _utc_now_trunc_hour_z() -> str:
-    now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
-    return now.isoformat().replace("+00:00", "Z")
 
 
 def _to_float(x: Any) -> Optional[float]:
@@ -52,10 +54,10 @@ def _to_float(x: Any) -> Optional[float]:
         return None
 
 
-def _ensure_time_z(s: Any) -> Optional[str]:
+def _ensure_time_hour_z(s: Any) -> Optional[str]:
     """
-    Tomorrow.io returns ISO timestamps with 'Z' already.
-    Normalize to minute precision with ':00Z' seconds if needed.
+    Tomorrow.io returns ISO timestamps with 'Z' (usually).
+    Normalize to UTC and truncate to the hour "YYYY-MM-DDTHH:00:00Z".
     """
     if not isinstance(s, str) or not s.strip():
         return None
@@ -67,26 +69,50 @@ def _ensure_time_z(s: Any) -> Optional[str]:
             dt = datetime.fromisoformat(t)
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
-        dt = dt.astimezone(timezone.utc).replace(second=0, microsecond=0)
+        dt = dt.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
         return dt.isoformat().replace("+00:00", "Z")
     except Exception:
-        if len(t) >= 16 and "T" in t:
-            return t[:16] + ":00Z"
+        if len(t) >= 13 and "T" in t:
+            return t[:13] + ":00:00Z"
         return None
+
+
+def _backfill_daily_from_hourly_temps(
+    target_dates: List[str],
+    axis: List[str],
+    temps: List[Optional[float]],
+    daily_by_date: Dict[str, Dict[str, Optional[float]]],
+) -> None:
+    if not axis or not temps or len(axis) != len(temps):
+        return
+
+    per: Dict[str, List[float]] = {}
+    for t, v in zip(axis, temps):
+        if v is None:
+            continue
+        d = t[:10]
+        if d in target_dates:
+            per.setdefault(d, []).append(float(v))
+
+    for d in target_dates:
+        rec = daily_by_date.setdefault(d, {"high_f": None, "low_f": None})
+        if rec.get("high_f") is not None and rec.get("low_f") is not None:
+            continue
+        vals = per.get(d) or []
+        if not vals:
+            continue
+        if rec.get("high_f") is None:
+            rec["high_f"] = max(vals)
+        if rec.get("low_f") is None:
+            rec["low_f"] = min(vals)
 
 
 def fetch_tom_forecast(station: dict, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """
-    Tomorrow.io collector -> STRICT payload.
+    Tomorrow.io collector -> STRICT payload, axis-aligned.
 
     Params:
       - include_hourly: bool (default True)
-
-    Units:
-      - units="imperial" => Fahrenheit, mph
-
-    Horizon:
-      - config.FORECAST_DAYS (centralized).
     """
     params = params or {}
 
@@ -103,24 +129,20 @@ def fetch_tom_forecast(station: dict, params: Dict[str, Any] | None = None) -> D
     if params.get("include_hourly") is not None:
         include_hourly = bool(params["include_hourly"])
 
-    # Centralized horizon
-    ndays = max(1, min(10, int(FORECAST_DAYS)))  # Tomorrow.io clamp (was 10)
-    today = date.today()
-    end_day = today + timedelta(days=ndays - 1)
-    want = {(today + timedelta(days=i)).isoformat() for i in range(ndays)}
+    # Shared axis
+    ndays = max(1, int(FORECAST_DAYS))
+    axis = build_hourly_axis_z(ndays)
+    axis_s = hourly_axis_set(axis)
+    start_utc, end_utc = axis_start_end(axis)
+    target_dates = daily_targets_from_axis(axis)[:ndays]
 
-    # Timeline span (UTC)
-    start_time = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
-    end_time = datetime.combine(end_day, datetime.max.time(), tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+    # Tomorrow timeline window (cover axis; endTime is inclusive-ish, add 1h pad)
+    start_time = start_utc.isoformat().replace("+00:00", "Z")
+    end_time = (end_utc + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
 
     daily_fields = [
         "temperatureMax",
         "temperatureMin",
-        "humidityAvg",
-        "windSpeedAvg",
-        "windDirectionAvg",
-        "cloudCoverAvg",
-        "precipitationProbabilityAvg",
     ]
 
     hourly_fields = [
@@ -159,11 +181,27 @@ def fetch_tom_forecast(station: dict, params: Dict[str, Any] | None = None) -> D
     r.raise_for_status()
     data = r.json()
 
-    issued_at = _utc_now_trunc_hour_z()
+    issued_at = truncate_issued_at_to_hour_z(datetime.now(timezone.utc))
+    if not issued_at:
+        issued_at = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0).isoformat().replace(
+            "+00:00", "Z"
+        )
 
     timelines = (data.get("data") or {}).get("timelines") or []
-    if not timelines:
-        return {"issued_at": issued_at, "daily": []}
+    if not isinstance(timelines, list) or not timelines:
+        out: Dict[str, Any] = {"issued_at": issued_at, "daily": []}
+        if include_hourly:
+            out["hourly"] = {
+                "time": axis,
+                "temperature_f": [None] * len(axis),
+                "dewpoint_f": [None] * len(axis),
+                "humidity_pct": [None] * len(axis),
+                "wind_speed_mph": [None] * len(axis),
+                "wind_dir_deg": [None] * len(axis),
+                "cloud_cover_pct": [None] * len(axis),
+                "precip_prob_pct": [None] * len(axis),
+            }
+        return out
 
     t_by_step: Dict[str, dict] = {}
     for tl in timelines:
@@ -171,20 +209,24 @@ def fetch_tom_forecast(station: dict, params: Dict[str, Any] | None = None) -> D
         if step:
             t_by_step[step] = tl
 
-    daily: List[Dict[str, Any]] = []
+    # Axis-aligned hourly output
     hourly_out: Dict[str, List[Any]] = {
-        "time": [],
-        "temperature_f": [],
-        "dewpoint_f": [],
-        "humidity_pct": [],
-        "wind_speed_mph": [],
-        "wind_dir_deg": [],
-        "cloud_cover_pct": [],
-        "precip_prob_pct": [],
+        "time": axis,
+        "temperature_f": [None] * len(axis),
+        "dewpoint_f": [None] * len(axis),
+        "humidity_pct": [None] * len(axis),
+        "wind_speed_mph": [None] * len(axis),
+        "wind_dir_deg": [None] * len(axis),
+        "cloud_cover_pct": [None] * len(axis),
+        "precip_prob_pct": [None] * len(axis),
     }
+    idx_map = {t: i for i, t in enumerate(axis)}
 
-    # ----- Daily -----
-    d_tl = t_by_step.get("1d") or (timelines[0] if timelines else None)
+    # Daily by date (API first)
+    daily_by_date: Dict[str, Dict[str, Optional[float]]] = {d: {"high_f": None, "low_f": None} for d in target_dates}
+
+    # ----- Daily (1d) -----
+    d_tl = t_by_step.get("1d")
     if isinstance(d_tl, dict):
         intervals = d_tl.get("intervals") or []
         if isinstance(intervals, list):
@@ -196,15 +238,16 @@ def fetch_tom_forecast(station: dict, params: Dict[str, Any] | None = None) -> D
                 if not isinstance(start, str) or not isinstance(vals, dict):
                     continue
                 d = start[:10]
-                if d not in want:
+                if d not in daily_by_date:
                     continue
                 hi = _to_float(vals.get("temperatureMax"))
                 lo = _to_float(vals.get("temperatureMin"))
-                if hi is None or lo is None:
-                    continue
-                daily.append({"target_date": d, "high_f": float(hi), "low_f": float(lo)})
+                if hi is not None:
+                    daily_by_date[d]["high_f"] = float(hi)
+                if lo is not None:
+                    daily_by_date[d]["low_f"] = float(lo)
 
-    # ----- Hourly -----
+    # ----- Hourly (1h) -----
     if include_hourly:
         h_tl = t_by_step.get("1h")
         if isinstance(h_tl, dict):
@@ -213,31 +256,40 @@ def fetch_tom_forecast(station: dict, params: Dict[str, Any] | None = None) -> D
                 for it in intervals:
                     if not isinstance(it, dict):
                         continue
-                    start = _ensure_time_z(it.get("startTime"))
+                    start = _ensure_time_hour_z(it.get("startTime"))
                     vals = it.get("values") or {}
                     if start is None or not isinstance(vals, dict):
                         continue
-
-                    d = start[:10]
-                    if d not in want:
+                    if start not in axis_s:
+                        continue
+                    i = idx_map.get(start)
+                    if i is None:
                         continue
 
-                    hourly_out["time"].append(start)
-                    hourly_out["temperature_f"].append(_to_float(vals.get("temperature")))
-                    hourly_out["dewpoint_f"].append(_to_float(vals.get("dewPoint")))
-                    hourly_out["humidity_pct"].append(_to_float(vals.get("humidity")))
-                    hourly_out["wind_speed_mph"].append(_to_float(vals.get("windSpeed")))
-                    hourly_out["wind_dir_deg"].append(_to_float(vals.get("windDirection")))
-                    hourly_out["cloud_cover_pct"].append(_to_float(vals.get("cloudCover")))
-                    hourly_out["precip_prob_pct"].append(_to_float(vals.get("precipitationProbability")))
+                    hourly_out["temperature_f"][i] = _to_float(vals.get("temperature"))
+                    hourly_out["dewpoint_f"][i] = _to_float(vals.get("dewPoint"))
+                    hourly_out["humidity_pct"][i] = _to_float(vals.get("humidity"))
+                    hourly_out["wind_speed_mph"][i] = _to_float(vals.get("windSpeed"))
+                    hourly_out["wind_dir_deg"][i] = _to_float(vals.get("windDirection"))
+                    hourly_out["cloud_cover_pct"][i] = _to_float(vals.get("cloudCover"))
+                    hourly_out["precip_prob_pct"][i] = _to_float(vals.get("precipitationProbability"))
+
+    # Daily fallback from hourly temps if missing
+    if any(
+        (daily_by_date[d].get("high_f") is None or daily_by_date[d].get("low_f") is None) for d in target_dates
+    ):
+        _backfill_daily_from_hourly_temps(target_dates, axis, hourly_out["temperature_f"], daily_by_date)
+
+    daily: List[Dict[str, Any]] = []
+    for d in target_dates:
+        rec = daily_by_date.get(d) or {}
+        hi = rec.get("high_f")
+        lo = rec.get("low_f")
+        if hi is None or lo is None:
+            continue
+        daily.append({"target_date": d, "high_f": float(hi), "low_f": float(lo)})
 
     out: Dict[str, Any] = {"issued_at": issued_at, "daily": daily}
-
-    if hourly_out["time"]:
-        min_len = min(len(v) for v in hourly_out.values())
-        if min_len > 0:
-            for k in list(hourly_out.keys()):
-                hourly_out[k] = hourly_out[k][:min_len]
-            out["hourly"] = hourly_out
-
+    if include_hourly:
+        out["hourly"] = hourly_out
     return out
