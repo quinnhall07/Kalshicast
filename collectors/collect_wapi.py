@@ -8,6 +8,12 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from config import HEADERS, FORECAST_DAYS
+from collectors.time_axis import (
+    build_hourly_axis_z,
+    daily_targets_from_axis,
+    hourly_axis_set,
+    truncate_issued_at_to_hour_z,
+)
 
 WAPI_URL = "https://api.weatherapi.com/v1/forecast.json"
 
@@ -20,8 +26,8 @@ STRICT payload shape required by sources_registry + morning.py:
     {"target_date": "YYYY-MM-DD", "high_f": float, "low_f": float},
     ...
   ],
-  "hourly": {                     # optional
-    "time": ["YYYY-MM-DDTHH:MM:00Z", ...],
+  "hourly": {
+    "time": ["YYYY-MM-DDTHH:00:00Z", ...],      # ALWAYS axis length (FORECAST_DAYS*24)
     "temperature_f": [float|None, ...],
     "dewpoint_f": [float|None, ...],
     "humidity_pct": [float|None, ...],
@@ -32,9 +38,9 @@ STRICT payload shape required by sources_registry + morning.py:
   }
 }
 
-Horizon policy:
-- Uses config.FORECAST_DAYS (today..today+FORECAST_DAYS-1 inclusive).
-- Hourly window is FORECAST_DAYS * 24 hours starting at 00:00 UTC today.
+Uses collectors.time_axis to enforce a shared forward-looking UTC axis.
+WeatherAPI may return fewer forecast days depending on plan; we still output a full axis,
+with missing points as None.
 """
 
 
@@ -43,21 +49,6 @@ def _get_key() -> str:
     if not key:
         raise RuntimeError("Missing WEATHERAPI_KEY env var")
     return key
-
-
-def _utc_now_trunc_hour_z() -> str:
-    now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
-    return now.isoformat().replace("+00:00", "Z")
-
-
-def _epoch_to_time_z(epoch: Any) -> Optional[str]:
-    if epoch is None:
-        return None
-    try:
-        dt = datetime.fromtimestamp(float(epoch), tz=timezone.utc).replace(second=0, microsecond=0)
-        return dt.isoformat().replace("+00:00", "Z")
-    except Exception:
-        return None
 
 
 def _to_float(x: Any) -> Optional[float]:
@@ -69,11 +60,50 @@ def _to_float(x: Any) -> Optional[float]:
         return None
 
 
+def _epoch_to_time_hour_z(epoch: Any) -> Optional[str]:
+    if epoch is None:
+        return None
+    try:
+        dt = datetime.fromtimestamp(float(epoch), tz=timezone.utc)
+        dt = dt.replace(minute=0, second=0, microsecond=0)
+        return dt.isoformat().replace("+00:00", "Z")
+    except Exception:
+        return None
+
+
+def _backfill_daily_from_hourly_temps(
+    target_dates: List[str],
+    axis: List[str],
+    temps: List[Optional[float]],
+    daily_by_date: Dict[str, Dict[str, Optional[float]]],
+) -> None:
+    if not axis or not temps or len(axis) != len(temps):
+        return
+
+    per: Dict[str, List[float]] = {}
+    for t, v in zip(axis, temps):
+        if v is None:
+            continue
+        d = t[:10]
+        if d in target_dates:
+            per.setdefault(d, []).append(float(v))
+
+    for d in target_dates:
+        rec = daily_by_date.setdefault(d, {"high_f": None, "low_f": None})
+        if rec.get("high_f") is not None and rec.get("low_f") is not None:
+            continue
+        vals = per.get(d) or []
+        if not vals:
+            continue
+        if rec.get("high_f") is None:
+            rec["high_f"] = max(vals)
+        if rec.get("low_f") is None:
+            rec["low_f"] = min(vals)
+
+
 def fetch_wapi_forecast(station: dict, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """
-    WeatherAPI collector -> STRICT payload with normalized horizon:
-      - daily: up to FORECAST_DAYS target dates (today..today+FORECAST_DAYS-1)
-      - hourly: up to FORECAST_DAYS * 24 hours starting at 00:00 UTC today
+    WeatherAPI collector -> STRICT payload, axis-aligned.
 
     Params:
       - include_hourly: bool (default True)
@@ -89,22 +119,21 @@ def fetch_wapi_forecast(station: dict, params: Dict[str, Any] | None = None) -> 
     if params.get("include_hourly") is not None:
         include_hourly = bool(params["include_hourly"])
 
+    # Shared axis
+    ndays = max(1, int(FORECAST_DAYS))
+    axis = build_hourly_axis_z(ndays)
+    axis_s = hourly_axis_set(axis)
+    target_dates = daily_targets_from_axis(axis)[:ndays]
+
+    # WeatherAPI wants an integer day count starting today; clamp to plan/API limits.
+    # If the plan returns fewer days, we keep axis and fill missing with None.
+    req_days = max(1, min(10, ndays))
+
     key = _get_key()
-
-    # WeatherAPI "days" is count starting today; clamp to API limits (plan-dependent).
-    ndays = max(1, min(10, int(FORECAST_DAYS)))
-    nhours = ndays * 24
-
-    base = date.today()
-    want_dates = {date.fromordinal(base.toordinal() + i).isoformat() for i in range(ndays)}
-
-    hour0 = datetime.combine(base, datetime.min.time(), tzinfo=timezone.utc)
-    hour_end = hour0 + timedelta(hours=nhours)
-
     q = {
         "key": key,
         "q": f"{float(lat)},{float(lon)}",
-        "days": ndays,
+        "days": req_days,
         "aqi": "no",
         "alerts": "no",
     }
@@ -113,32 +142,45 @@ def fetch_wapi_forecast(station: dict, params: Dict[str, Any] | None = None) -> 
     r.raise_for_status()
     data = r.json()
 
-    issued_at = _utc_now_trunc_hour_z()
+    issued_at = truncate_issued_at_to_hour_z(datetime.now(timezone.utc))
+    if not issued_at:
+        issued_at = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0).isoformat().replace(
+            "+00:00", "Z"
+        )
 
-    forecast_days = (data.get("forecast") or {}).get("forecastday") or []
-    daily: List[Dict[str, Any]] = []
-
+    # ---- Prepare output containers (axis-aligned) ----
     hourly_out: Dict[str, List[Any]] = {
-        "time": [],
-        "temperature_f": [],
-        "dewpoint_f": [],
-        "humidity_pct": [],
-        "wind_speed_mph": [],
-        "wind_dir_deg": [],
-        "cloud_cover_pct": [],
-        "precip_prob_pct": [],
+        "time": axis,
+        "temperature_f": [None] * len(axis),
+        "dewpoint_f": [None] * len(axis),
+        "humidity_pct": [None] * len(axis),
+        "wind_speed_mph": [None] * len(axis),
+        "wind_dir_deg": [None] * len(axis),
+        "cloud_cover_pct": [None] * len(axis),
+        "precip_prob_pct": [None] * len(axis),
     }
 
+    daily_by_date: Dict[str, Dict[str, Optional[float]]] = {d: {"high_f": None, "low_f": None} for d in target_dates}
+
+    forecast_days = (data.get("forecast") or {}).get("forecastday") or []
+    if not isinstance(forecast_days, list):
+        forecast_days = []
+
+    # ---- Fill from provider ----
     for day in forecast_days:
-        d = str(day.get("date") or "")[:10]
-        if not d or d not in want_dates:
+        if not isinstance(day, dict):
             continue
 
-        daydata = day.get("day") or {}
-        hi = _to_float(daydata.get("maxtemp_f"))
-        lo = _to_float(daydata.get("mintemp_f"))
-        if hi is not None and lo is not None:
-            daily.append({"target_date": d, "high_f": float(hi), "low_f": float(lo)})
+        d = str(day.get("date") or "")[:10]
+        if d and d in daily_by_date:
+            daydata = day.get("day") or {}
+            if isinstance(daydata, dict):
+                hi = _to_float(daydata.get("maxtemp_f"))
+                lo = _to_float(daydata.get("mintemp_f"))
+                if hi is not None:
+                    daily_by_date[d]["high_f"] = float(hi)
+                if lo is not None:
+                    daily_by_date[d]["low_f"] = float(lo)
 
         if not include_hourly:
             continue
@@ -151,55 +193,59 @@ def fetch_wapi_forecast(station: dict, params: Dict[str, Any] | None = None) -> 
             if not isinstance(h, dict):
                 continue
 
-            t = _epoch_to_time_z(h.get("time_epoch"))
-            if t is None:
+            t = _epoch_to_time_hour_z(h.get("time_epoch"))
+            if t is None or t not in axis_s:
                 continue
 
-            try:
-                dt = datetime.fromisoformat(t[:-1] + "+00:00")
-            except Exception:
+            # index into axis (fast enough at 96, but keep predictable)
+            # build a map once if needed
+            # (we avoid extra helper to keep file self-contained)
+            # We'll compute position with a dict.
+    # build index map once
+    idx_map = {t: i for i, t in enumerate(axis)}
+
+    if include_hourly:
+        for day in forecast_days:
+            if not isinstance(day, dict):
                 continue
-
-            if dt < hour0 or dt >= hour_end:
+            hours = day.get("hour") or []
+            if not isinstance(hours, list):
                 continue
+            for h in hours:
+                if not isinstance(h, dict):
+                    continue
+                t = _epoch_to_time_hour_z(h.get("time_epoch"))
+                if t is None:
+                    continue
+                i = idx_map.get(t)
+                if i is None:
+                    continue
 
-            hourly_out["time"].append(t)
-            hourly_out["temperature_f"].append(_to_float(h.get("temp_f")))
-            hourly_out["dewpoint_f"].append(_to_float(h.get("dewpoint_f")))
-            hourly_out["humidity_pct"].append(_to_float(h.get("humidity")))
-            hourly_out["wind_speed_mph"].append(_to_float(h.get("wind_mph")))
-            hourly_out["wind_dir_deg"].append(_to_float(h.get("wind_degree")))
-            hourly_out["cloud_cover_pct"].append(_to_float(h.get("cloud")))
-            hourly_out["precip_prob_pct"].append(_to_float(h.get("chance_of_rain")))
+                hourly_out["temperature_f"][i] = _to_float(h.get("temp_f"))
+                hourly_out["dewpoint_f"][i] = _to_float(h.get("dewpoint_f"))
+                hourly_out["humidity_pct"][i] = _to_float(h.get("humidity"))
+                hourly_out["wind_speed_mph"][i] = _to_float(h.get("wind_mph"))
+                hourly_out["wind_dir_deg"][i] = _to_float(h.get("wind_degree"))
+                hourly_out["cloud_cover_pct"][i] = _to_float(h.get("cloud"))
+                # chance_of_rain is a % (string/int) for rain; keep as float
+                hourly_out["precip_prob_pct"][i] = _to_float(h.get("chance_of_rain"))
 
-    # Sort + de-dup hourly by time (WeatherAPI can repeat at day boundaries)
-    if hourly_out["time"]:
-        idx = sorted(range(len(hourly_out["time"])), key=lambda i: hourly_out["time"][i])
-        for k in list(hourly_out.keys()):
-            hourly_out[k] = [hourly_out[k][i] for i in idx]
+    # ---- Daily fallback from hourly temps if missing ----
+    if any(
+        (daily_by_date[d].get("high_f") is None or daily_by_date[d].get("low_f") is None) for d in target_dates
+    ):
+        _backfill_daily_from_hourly_temps(target_dates, axis, hourly_out["temperature_f"], daily_by_date)
 
-        seen = set()
-        keep = []
-        for i, t in enumerate(hourly_out["time"]):
-            if t in seen:
-                continue
-            seen.add(t)
-            keep.append(i)
-
-        for k in list(hourly_out.keys()):
-            hourly_out[k] = [hourly_out[k][i] for i in keep]
-
-        # Enforce max points
-        for k in list(hourly_out.keys()):
-            hourly_out[k] = hourly_out[k][:nhours]
+    daily: List[Dict[str, Any]] = []
+    for d in target_dates:
+        rec = daily_by_date.get(d) or {}
+        hi = rec.get("high_f")
+        lo = rec.get("low_f")
+        if hi is None or lo is None:
+            continue
+        daily.append({"target_date": d, "high_f": float(hi), "low_f": float(lo)})
 
     out: Dict[str, Any] = {"issued_at": issued_at, "daily": daily}
-
-    if include_hourly and hourly_out["time"]:
-        min_len = min(len(v) for v in hourly_out.values())
-        if min_len > 0:
-            for k in list(hourly_out.keys()):
-                hourly_out[k] = hourly_out[k][:min_len]
-            out["hourly"] = hourly_out
-
+    if include_hourly:
+        out["hourly"] = hourly_out
     return out
