@@ -5,7 +5,7 @@ import os
 import random
 import threading
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -18,6 +18,13 @@ from config import (
     OME_MAX_INFLIGHT,
     OME_MAX_ATTEMPTS,
     OME_BACKOFF_BASE_S,
+)
+from collectors.time_axis import (
+    axis_start_end,
+    build_hourly_axis_z,
+    daily_targets_from_axis,
+    hourly_axis_set,
+    truncate_issued_at_to_hour_z,
 )
 
 OME_URL = "https://api.open-meteo.com/v1/forecast"
@@ -45,11 +52,6 @@ _OME_SESSION.mount(
     "https://",
     HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=0),
 )
-
-
-def _utc_now_trunc_hour_z() -> str:
-    now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
-    return now.isoformat().replace("+00:00", "Z")
 
 
 def _parse_timeout_from_env(default: Tuple[float, float]) -> Tuple[float, float]:
@@ -100,12 +102,64 @@ def _get_with_retries(url: str, *, params: Dict[str, Any]) -> dict:
             if attempt >= int(OME_MAX_ATTEMPTS) or not _is_retryable_exc(e):
                 raise
 
-            # jittered exponential backoff
             base = float(OME_BACKOFF_BASE_S) * (2 ** (attempt - 1))
             sleep_s = base * random.uniform(0.75, 1.25)
             time.sleep(sleep_s)
 
     raise last  # pragma: no cover
+
+
+def _ensure_time_hour_z(ts: Any) -> Optional[str]:
+    """
+    Open-Meteo hourly time is typically "YYYY-MM-DDTHH:MM" (timezone=UTC).
+    Normalize to hour-truncated "YYYY-MM-DDTHH:00:00Z".
+    """
+    if not isinstance(ts, str) or not ts.strip():
+        return None
+    s = ts.strip()
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        return dt.isoformat().replace("+00:00", "Z")
+    except Exception:
+        # fallback for "YYYY-MM-DDTHH:MM"
+        if len(s) >= 13 and s[10] == "T":
+            return s[:13] + ":00:00Z"
+        return None
+
+
+def _reindex_axis(axis: List[str], m: Dict[str, float]) -> List[Optional[float]]:
+    return [float(m[t]) if t in m else None for t in axis]
+
+
+def _backfill_daily_from_hourly_temps(
+    target_dates: List[str],
+    axis: List[str],
+    temps: List[Optional[float]],
+    by_date: Dict[str, Dict[str, Optional[float]]],
+) -> None:
+    if not axis or not temps or len(axis) != len(temps):
+        return
+
+    per: Dict[str, List[float]] = {}
+    for t, v in zip(axis, temps):
+        if v is None:
+            continue
+        d = t[:10]
+        if d in target_dates:
+            per.setdefault(d, []).append(float(v))
+
+    for d in target_dates:
+        rec = by_date.setdefault(d, {"high_f": None, "low_f": None})
+        vals = per.get(d) or []
+        if not vals:
+            continue
+        if rec.get("high_f") is None:
+            rec["high_f"] = max(vals)
+        if rec.get("low_f") is None:
+            rec["low_f"] = min(vals)
 
 
 def fetch_ome_forecast(station: dict, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -114,35 +168,43 @@ def fetch_ome_forecast(station: dict, params: Optional[Dict[str, Any]] = None) -
       {
         "issued_at": "...Z",
         "daily": [ {"target_date":"YYYY-MM-DD","high_f":float,"low_f":float}, ... ],
-        "hourly": { "time":[...], "<var>":[...], ... }   # Open-Meteo arrays (unaggregated)
+        "hourly": { "time":[...], "<var>":[...], ... }   # Open-Meteo arrays (axis-aligned)
       }
+
+    Uses collectors.time_axis to enforce a forward-looking UTC axis.
     """
     lat = station.get("lat")
     lon = station.get("lon")
     if lat is None or lon is None:
         raise ValueError("Open-Meteo fetch requires station['lat'] and station['lon'].")
 
+    # Horizon (centralized)
     days = int(FORECAST_DAYS)
-    days = max(1, min(14, days))  # safety clamp
-    today = date.today()
-    end_date = today + timedelta(days=days - 1)  # inclusive
+    days = max(1, min(14, days))
+
+    # Shared axis
+    axis = build_hourly_axis_z(days)
+    axis_s = hourly_axis_set(axis)
+    start_utc, end_utc = axis_start_end(axis)
+    target_dates = daily_targets_from_axis(axis)[:days]
+
+    # Open-Meteo only accepts date windows; request the UTC dates that cover the axis.
+    start_date = start_utc.date().isoformat()
+    end_date = end_utc.date().isoformat()
 
     q: Dict[str, Any] = {
         "latitude": float(lat),
         "longitude": float(lon),
 
-        # daily highs/lows
-        "daily": ",".join(_DAILY_VARS),
-        "start_date": today.isoformat(),
-        "end_date": end_date.isoformat(),
-
-        # hourly, unaggregated features
-        "hourly": ",".join(_HOURLY_VARS),
-
-        # consistent units
         "timezone": "UTC",
         "temperature_unit": "fahrenheit",
         "wind_speed_unit": "mph",
+
+        "start_date": start_date,
+        "end_date": end_date,
+
+        "daily": ",".join(_DAILY_VARS),
+        "hourly": ",".join(_HOURLY_VARS),
     }
 
     if params:
@@ -150,31 +212,93 @@ def fetch_ome_forecast(station: dict, params: Optional[Dict[str, Any]] = None) -
 
     data = _get_with_retries(OME_URL, params=q)
 
-    issued_at = _utc_now_trunc_hour_z()
+    issued_at = truncate_issued_at_to_hour_z(datetime.now(timezone.utc))
+    if not issued_at:
+        issued_at = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0).isoformat().replace(
+            "+00:00", "Z"
+        )
 
-    # ---- daily list ----
+    # ---- Hourly (build maps from provider arrays, then reindex to axis) ----
+    hourly = data.get("hourly") or {}
+    h_time = hourly.get("time") or []
+    if not isinstance(h_time, list):
+        h_time = []
+
+    # normalize provider times to hour-truncated Z and filter to axis
+    provider_times: List[str] = []
+    for t in h_time:
+        tz = _ensure_time_hour_z(t)
+        if tz is None:
+            provider_times = []
+            break
+        provider_times.append(tz)
+
+    # Build per-variable maps keyed by axis timestamps
+    var_maps: Dict[str, Dict[str, float]] = {}
+    if provider_times:
+        for var in _HOURLY_VARS:
+            arr = hourly.get(var)
+            if not isinstance(arr, list):
+                continue
+            m: Dict[str, float] = {}
+            for t, v in zip(provider_times, arr):
+                if t not in axis_s:
+                    continue
+                try:
+                    fv = float(v)
+                except Exception:
+                    continue
+                m[t] = fv
+            var_maps[var] = m
+
+    # Axis-aligned hourly arrays (always axis length)
+    hourly_out: Dict[str, Any] = {"time": axis}
+    for var in _HOURLY_VARS:
+        m = var_maps.get(var) or {}
+        hourly_out[var] = _reindex_axis(axis, m)
+
+    # ---- Daily (from API; align to target_dates; fallback from hourly temps if needed) ----
     daily = data.get("daily") or {}
-    dates = daily.get("time") or []
-    tmax = daily.get("temperature_2m_max") or []
-    tmin = daily.get("temperature_2m_min") or []
+    d_time = daily.get("time") or []
+    d_hi = daily.get("temperature_2m_max") or []
+    d_lo = daily.get("temperature_2m_min") or []
 
-    out_daily: List[dict] = []
-    if isinstance(dates, list) and dates:
-        n = min(len(dates), len(tmax), len(tmin))
+    daily_by_date: Dict[str, Dict[str, Optional[float]]] = {d: {"high_f": None, "low_f": None} for d in target_dates}
+
+    if isinstance(d_time, list) and isinstance(d_hi, list) and isinstance(d_lo, list):
+        n = min(len(d_time), len(d_hi), len(d_lo))
         for i in range(n):
-            td = str(dates[i])[:10]
+            d = str(d_time[i])[:10]
+            if d not in daily_by_date:
+                continue
             try:
-                high_f = float(tmax[i])
-                low_f = float(tmin[i])
+                hi = float(d_hi[i])
+                lo = float(d_lo[i])
             except Exception:
                 continue
-            out_daily.append({"target_date": td, "high_f": high_f, "low_f": low_f})
+            daily_by_date[d]["high_f"] = hi
+            daily_by_date[d]["low_f"] = lo
 
-    # ---- hourly arrays ----
-    hourly = data.get("hourly")
+    # Fallback only for missing dates (allowed)
+    if any(
+        (daily_by_date[d].get("high_f") is None or daily_by_date[d].get("low_f") is None) for d in target_dates
+    ):
+        _backfill_daily_from_hourly_temps(
+            target_dates,
+            axis,
+            hourly_out.get("temperature_2m") or [],
+            daily_by_date,
+        )
+
+    out_daily: List[dict] = []
+    for d in target_dates:
+        rec = daily_by_date.get(d) or {}
+        hi = rec.get("high_f")
+        lo = rec.get("low_f")
+        if hi is None or lo is None:
+            continue
+        out_daily.append({"target_date": d, "high_f": float(hi), "low_f": float(lo)})
+
     out: Dict[str, Any] = {"issued_at": issued_at, "daily": out_daily}
-
-    if isinstance(hourly, dict) and isinstance(hourly.get("time"), list) and hourly["time"]:
-        out["hourly"] = hourly
-
+    out["hourly"] = hourly_out
     return out
