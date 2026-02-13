@@ -219,7 +219,7 @@ SOURCES = {
     # Tomorrow.io
     "TOM": {
         "name": "Tomorrow.io",
-        "enabled": True,
+        "enabled": False,
         "module": "collectors.collect_tom",
         "func": "fetch_tom_forecast",
         "params": {
@@ -228,3 +228,4 @@ SOURCES = {
         },
     },
 }
+
