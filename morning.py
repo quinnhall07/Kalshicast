@@ -8,7 +8,7 @@ import random
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import requests
 
@@ -37,6 +37,7 @@ DEBUG_STATION = os.getenv("DEBUG_STATION", "").strip()    # exact station_id, e.
 MAX_ATTEMPTS = 5
 BASE_SLEEP_SECONDS = 0.75
 
+
 def _env_int(name: str, default: int) -> int:
     v = os.getenv(name, "").strip()
     if not v:
@@ -45,6 +46,7 @@ def _env_int(name: str, default: int) -> int:
         return int(v)
     except Exception:
         return default
+
 
 # Provider concurrency caps (Open-Meteo lowered)
 _PROVIDER_LIMITS = {
@@ -64,11 +66,6 @@ _PROVIDER_LIMITS = {
 #   "daily": [ {"target_date":"YYYY-MM-DD","high_f":float,"low_f":float}, ... ],
 #   "hourly": { "time":[...], optional variable arrays ... }  # Open-Meteo style arrays
 # }
-#
-# Notes:
-# - "daily" is required (may be empty list).
-# - "hourly" is optional.
-# - No legacy list[dict] shape accepted.
 
 
 def _provider_key(source_id: str) -> str:
@@ -84,6 +81,7 @@ def _provider_key(source_id: str) -> str:
         return "OME"
     return "OTHER"
 
+
 def _sleep_jittered_exponential(attempt: int, *, cap_s: float) -> float:
     """
     Exponential backoff with full jitter.
@@ -92,6 +90,40 @@ def _sleep_jittered_exponential(attempt: int, *, cap_s: float) -> float:
     exp = BASE_SLEEP_SECONDS * (2 ** (attempt - 1))
     exp = min(cap_s, exp)
     return random.random() * exp  # full jitter in [0, exp)
+
+
+def _is_retryable_error(e: Exception) -> bool:
+    if isinstance(e, (requests.Timeout, requests.ConnectionError)):
+        return True
+    if isinstance(e, requests.HTTPError):
+        resp = getattr(e, "response", None)
+        code = getattr(resp, "status_code", None)
+        if code is None:
+            return True
+        return code == 429 or code >= 500
+
+    msg = str(e).lower()
+    return any(
+        h in msg
+        for h in [
+            "timed out",
+            "timeout",
+            "temporarily",
+            "try again",
+            "connection reset",
+            "service unavailable",
+            "internal server error",
+            "bad gateway",
+            "gateway timeout",
+            "too many requests",
+            "rate limit",
+        ]
+    )
+
+
+def _debug_match(station_id: str, source_id: str) -> bool:
+    return DEBUG_DUMP and (DEBUG_SOURCE == source_id) and (DEBUG_STATION == station_id)
+
 
 def _call_fetcher_with_retry(fetcher, station: dict, source_id: str) -> Any:
     last_exc: Exception | None = None
@@ -111,76 +143,14 @@ def _call_fetcher_with_retry(fetcher, station: dict, source_id: str) -> Any:
             if attempt >= MAX_ATTEMPTS or not _is_retryable_error(e):
                 raise
 
-            # 429: longer cap to avoid hammering; otherwise standard cap
             msg = str(e).lower()
             is_429 = ("429" in msg) or ("too many requests" in msg) or ("rate limit" in msg)
 
             if is_429:
-                sleep_s = 10.0 + random.random() * 10.0  # keep simple + long
+                sleep_s = 10.0 + random.random() * 10.0
             else:
-                # Open-Meteo: slightly higher cap to smooth bursty failures
                 cap = 12.0 if prov == "OME" else 6.0
                 sleep_s = _sleep_jittered_exponential(attempt, cap_s=cap)
-
-            print(
-                f"[morning] RETRY {station['station_id']} {source_id} attempt {attempt}/{MAX_ATTEMPTS}: {e}",
-                flush=True,
-            )
-            time.sleep(sleep_s)
-
-    raise last_exc  # pragma: no cover
-
-def _is_retryable_error(e: Exception) -> bool:
-    if isinstance(e, (requests.Timeout, requests.ConnectionError)):
-        return True
-    if isinstance(e, requests.HTTPError):
-        resp = getattr(e, "response", None)
-        code = getattr(resp, "status_code", None)
-        if code is None:
-            return True
-        return code == 429 or code >= 500
-
-    msg = str(e).lower()
-    return any(h in msg for h in [
-        "timed out",
-        "timeout",
-        "temporarily",
-        "try again",
-        "connection reset",
-        "service unavailable",
-        "internal server error",
-        "bad gateway",
-        "gateway timeout",
-        "too many requests",
-        "rate limit",
-    ])
-
-
-def _debug_match(station_id: str, source_id: str) -> bool:
-    return DEBUG_DUMP and (DEBUG_SOURCE == source_id) and (DEBUG_STATION == station_id)
-
-
-def _call_fetcher_with_retry(fetcher, station: dict, source_id: str) -> Any:
-    last_exc: Exception | None = None
-    sem = _PROVIDER_LIMITS.get(_provider_key(source_id))
-
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        try:
-            print(f"[morning] fetch start {station['station_id']} {source_id} attempt={attempt}", flush=True)
-            if sem:
-                with sem:
-                    return fetcher(station)
-            return fetcher(station)
-        except Exception as e:
-            last_exc = e
-            if attempt >= MAX_ATTEMPTS or not _is_retryable_error(e):
-                raise
-
-            msg = str(e).lower()
-            is_429 = ("429" in msg) or ("too many requests" in msg) or ("rate limit" in msg)
-            sleep_s = (10.0 + random.random() * 5.0) if is_429 else min(
-                5.0, (BASE_SLEEP_SECONDS * attempt) + random.random() * 0.5
-            )
 
             print(
                 f"[morning] RETRY {station['station_id']} {source_id} attempt {attempt}/{MAX_ATTEMPTS}: {e}",
@@ -233,8 +203,7 @@ def _normalize_daily(payload: dict) -> List[Dict[str, Any]]:
 
 def _normalize_hourly_arrays(payload: dict) -> List[Dict[str, Any]]:
     """
-    Hourly is stored unaggregated.
-    Supported hourly payload: Open-Meteo style arrays:
+    Hourly payload: Open-Meteo style arrays:
       payload["hourly"] = { "time": [...], "<var>": [...], ... }
 
     We map provider keys -> standardized DB column keys.
@@ -304,6 +273,40 @@ def _normalize_payload_strict(raw: Any) -> Tuple[str, List[Dict[str, Any]], List
     return issued_at, daily_rows, hourly_rows
 
 
+def _count_nonempty_daily_batch(rows: List[Dict[str, Any]]) -> int:
+    # daily rows are considered "real" if high/low are present
+    n = 0
+    for r in rows or []:
+        if r.get("high_f") is not None or r.get("low_f") is not None:
+            n += 1
+    return n
+
+
+def _count_nonempty_hourly_batch(rows: List[Dict[str, Any]]) -> int:
+    """
+    Count hourly rows where at least one forecast field is non-null.
+    Excludes always-present keys: run_id, station_id, valid_time.
+    """
+    n = 0
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        if any(
+            r.get(k) is not None
+            for k in (
+                "temperature_f",
+                "dewpoint_f",
+                "humidity_pct",
+                "wind_speed_mph",
+                "wind_dir_deg",
+                "cloud_cover_pct",
+                "precip_prob_pct",
+            )
+        ):
+            n += 1
+    return n
+
+
 def _fetch_one(st: dict, source_id: str, fetcher):
     station_id = st["station_id"]
     try:
@@ -359,8 +362,14 @@ def main() -> None:
         if not DEBUG_SOURCE or not DEBUG_STATION:
             print("[DEBUG] Set DEBUG_SOURCE and DEBUG_STATION to enable payload dumps.", flush=True)
 
+    # Totals for end-of-run summary
+    total_daily_written = 0
+    total_hourly_written = 0
+    total_daily_nonempty = 0
+    total_hourly_nonempty = 0
+
     tasks: List[concurrent.futures.Future] = []
-    max_workers = _env_int("MORNING_MAX_WORKERS", 10)  # was hardcoded 12
+    max_workers = _env_int("MORNING_MAX_WORKERS", 10)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
         for st in STATIONS:
             for source_id, fetcher in fetchers.items():
@@ -399,19 +408,30 @@ def main() -> None:
                             kind="low",
                         )
 
-                        daily_batch.append({
-                            "run_id": run_id,
-                            "station_id": station_id,
-                            "target_date": td,
-                            "high_f": r["high_f"],
-                            "low_f": r["low_f"],
-                            "lead_high_hours": lead_high,
-                            "lead_low_hours": lead_low,
-                        })
+                        daily_batch.append(
+                            {
+                                "run_id": run_id,
+                                "station_id": station_id,
+                                "target_date": td,
+                                "high_f": r["high_f"],
+                                "low_f": r["low_f"],
+                                "lead_high_hours": lead_high,
+                                "lead_low_hours": lead_low,
+                            }
+                        )
 
+                    daily_nonempty = _count_nonempty_daily_batch(daily_batch)
                     wrote = bulk_upsert_forecasts_daily(conn, daily_batch)
                     conn.commit()
-                    print(f"[morning] OK {station_id} {source_id}: wrote {wrote} daily rows issued_at={issued_at}", flush=True)
+
+                    total_daily_written += int(wrote or 0)
+                    total_daily_nonempty += daily_nonempty
+
+                    print(
+                        f"[morning] OK {station_id} {source_id}: wrote {wrote} daily rows "
+                        f"(nonempty={daily_nonempty}) issued_at={issued_at}",
+                        flush=True,
+                    )
 
                 # ---- HOURLY ----
                 if hourly_rows:
@@ -421,26 +441,41 @@ def main() -> None:
                         if not isinstance(vt, str) or not vt.strip():
                             continue
 
-                        hourly_batch.append({
-                            "run_id": run_id,
-                            "station_id": station_id,
-                            "valid_time": vt.strip(),
-                            "temperature_f": hr.get("temperature_f"),
-                            "dewpoint_f": hr.get("dewpoint_f"),
-                            "humidity_pct": hr.get("humidity_pct"),
-                            "wind_speed_mph": hr.get("wind_speed_mph"),
-                            "wind_dir_deg": hr.get("wind_dir_deg"),
-                            "cloud_cover_pct": hr.get("cloud_cover_pct"),
-                            "precip_prob_pct": hr.get("precip_prob_pct"),
-                        })
+                        hourly_batch.append(
+                            {
+                                "run_id": run_id,
+                                "station_id": station_id,
+                                "valid_time": vt.strip(),
+                                "temperature_f": hr.get("temperature_f"),
+                                "dewpoint_f": hr.get("dewpoint_f"),
+                                "humidity_pct": hr.get("humidity_pct"),
+                                "wind_speed_mph": hr.get("wind_speed_mph"),
+                                "wind_dir_deg": hr.get("wind_dir_deg"),
+                                "cloud_cover_pct": hr.get("cloud_cover_pct"),
+                                "precip_prob_pct": hr.get("precip_prob_pct"),
+                            }
+                        )
 
                     if hourly_batch:
+                        hourly_nonempty = _count_nonempty_hourly_batch(hourly_batch)
                         wrote = bulk_upsert_forecast_extras_hourly(conn, hourly_batch)
                         conn.commit()
-                        print(f"[morning] OK {station_id} {source_id}: wrote {wrote} hourly rows issued_at={issued_at}", flush=True)
+
+                        total_hourly_written += int(wrote or 0)
+                        total_hourly_nonempty += hourly_nonempty
+
+                        print(
+                            f"[morning] OK {station_id} {source_id}: wrote {wrote} hourly rows "
+                            f"(nonempty={hourly_nonempty}) issued_at={issued_at}",
+                            flush=True,
+                        )
+
+    print(
+        f"[morning] TOTAL wrote daily_rows={total_daily_written} (nonempty={total_daily_nonempty}) "
+        f"hourly_rows={total_hourly_written} (nonempty={total_hourly_nonempty})",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
     main()
-
-
